@@ -113,6 +113,9 @@ Its core features include:
    developer_guide/development_jit_kernel_guide.md
    developer_guide/benchmark_and_profiling.md
    developer_guide/bench_serving.md
+   developer_guide/cross_context_kv_graft.md
+   developer_guide/kv_graft_tensor_equivalence_investigation.md
+   developer_guide/kv_graft_stage2_origin_start_fix.md
    developer_guide/evaluating_new_models.md
 
 .. toctree::

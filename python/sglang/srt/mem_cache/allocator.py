@@ -54,6 +54,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self.external_hold_counts = None
+        self.pending_free_counts = None
 
     def debug_print(self) -> str:
         return ""
@@ -70,6 +72,62 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def backup_state(self):
         return (self.free_pages, self.release_pages)
 
+    def _init_hold_tracking(self, num_items: int):
+        self.external_hold_counts = torch.zeros(
+            (num_items,), dtype=torch.int32, device=self.device
+        )
+        self.pending_free_counts = torch.zeros(
+            (num_items,), dtype=torch.int32, device=self.device
+        )
+
+    def _normalize_to_items(self, indices: torch.Tensor) -> torch.Tensor:
+        if indices is None or indices.numel() == 0:
+            return torch.empty((0,), dtype=torch.int64, device=self.device)
+        return indices.to(device=self.device, dtype=torch.int64)
+
+    def external_held_size(self) -> int:
+        if self.external_hold_counts is None:
+            return 0
+        return int((self.external_hold_counts > 0).sum().item()) * self.page_size
+
+    def hold(self, indices: torch.Tensor):
+        items = self._normalize_to_items(indices)
+        if items.numel() == 0:
+            return
+        items = torch.unique(items)
+        self.external_hold_counts[items] += 1
+
+    def release_hold(self, indices: torch.Tensor):
+        items = self._normalize_to_items(indices)
+        if items.numel() == 0:
+            return
+        items = torch.unique(items)
+        if torch.any(self.external_hold_counts[items] <= 0):
+            raise RuntimeError("release_hold called on indices without active hold")
+        self.external_hold_counts[items] -= 1
+        ready = items[
+            (self.external_hold_counts[items] == 0)
+            & (self.pending_free_counts[items] > 0)
+        ]
+        if ready.numel() == 0:
+            return
+        self.pending_free_counts[ready] = 0
+        self._append_freed_items(ready)
+
+    def _defer_or_collect_items(self, items: torch.Tensor) -> torch.Tensor:
+        if items.numel() == 0:
+            return items
+        held_mask = self.external_hold_counts[items] > 0
+        if torch.any(held_mask):
+            held_items = items[held_mask]
+            self.pending_free_counts[held_items] += 1
+            items = items[~held_mask]
+        return items
+
+    @abc.abstractmethod
+    def _append_freed_items(self, items: torch.Tensor):
+        raise NotImplementedError()
+
     def free_group_begin(self):
         self.is_not_in_free_group = False
         self.free_group = []
@@ -82,10 +140,25 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def merge_and_sort_free(self):
         if len(self.release_pages) > 0:
             self.free_pages = torch.cat((self.free_pages, self.release_pages))
+            self.free_pages = torch.unique(self.free_pages)
             self.free_pages, _ = torch.sort(self.free_pages)
             self.release_pages = torch.empty(
                 (0,), dtype=self.release_pages.dtype, device=self.device
             )
+
+    def _filter_existing_free_items(self, items: torch.Tensor) -> torch.Tensor:
+        if items.numel() == 0:
+            return items
+        items = torch.unique(items.to(dtype=torch.int64, device=self.device))
+        existing_parts = []
+        if self.free_pages is not None and len(self.free_pages) > 0:
+            existing_parts.append(self.free_pages.to(dtype=torch.int64))
+        if self.release_pages is not None and len(self.release_pages) > 0:
+            existing_parts.append(self.release_pages.to(dtype=torch.int64))
+        if not existing_parts:
+            return items
+        existing = torch.unique(torch.cat(existing_parts))
+        return items[~torch.isin(items, existing)]
 
     def get_cpu_copy(self, *args, **kwargs):
         # FIXME: reuse the get_cpu_copy after paged allocator is implemented
@@ -136,6 +209,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+        self._init_hold_tracking(self.size + 1)
 
     def available_size(self):
         # To avoid minor "len(free_pages) * 1" overhead
@@ -156,11 +230,12 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
+        free_index = self._defer_or_collect_items(free_index.to(torch.int64))
+        if free_index.numel() == 0:
+            return
+
         if self.is_not_in_free_group:
-            if self.need_sort:
-                self.release_pages = torch.cat((self.release_pages, free_index))
-            else:
-                self.free_pages = torch.cat((self.free_pages, free_index))
+            self._append_freed_items(free_index)
         else:
             self.free_group.append(free_index)
 
@@ -169,6 +244,17 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+
+    def _append_freed_items(self, items: torch.Tensor):
+        if items.numel() == 0:
+            return
+        items = self._filter_existing_free_items(items)
+        if items.numel() == 0:
+            return
+        if self.need_sort:
+            self.release_pages = torch.cat((self.release_pages, items))
+        else:
+            self.free_pages = torch.cat((self.free_pages, items))
 
 
 def alloc_extend_naive(
@@ -377,6 +463,12 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
         self.clear()
 
+    def _normalize_to_items(self, indices: torch.Tensor) -> torch.Tensor:
+        items = super()._normalize_to_items(indices)
+        if items.numel() == 0:
+            return items
+        return torch.unique(items // self.page_size)
+
     def alloc(self, need_size: int):
         # page-aligned allocation, returning contiguous indices of pages
         if self.debug_mode:
@@ -491,14 +583,15 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
+        free_page_indices = torch.unique((free_index // self.page_size).to(torch.int64))
+        free_page_indices = self._defer_or_collect_items(free_page_indices)
+        if free_page_indices.numel() == 0:
+            return
+
         if self.is_not_in_free_group:
-            free_page_indices = torch.unique(free_index // self.page_size)
-            if self.need_sort:
-                self.release_pages = torch.cat((free_page_indices, self.release_pages))
-            else:
-                self.free_pages = torch.cat((free_page_indices, self.free_pages))
+            self._append_freed_items(free_page_indices)
         else:
-            self.free_group.append(free_index)
+            self.free_group.append(free_page_indices * self.page_size)
 
         if self.debug_mode:
             assert len(torch.unique(self.free_pages)) == len(self.free_pages)
@@ -511,9 +604,21 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+        self._init_hold_tracking(self.num_pages + 1)
 
     def get_cpu_copy(self, indices):
         return self._kvcache.get_cpu_copy(indices)
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+
+    def _append_freed_items(self, items: torch.Tensor):
+        if items.numel() == 0:
+            return
+        items = self._filter_existing_free_items(items)
+        if items.numel() == 0:
+            return
+        if self.need_sort:
+            self.release_pages = torch.cat((items, self.release_pages))
+        else:
+            self.free_pages = torch.cat((items, self.free_pages))

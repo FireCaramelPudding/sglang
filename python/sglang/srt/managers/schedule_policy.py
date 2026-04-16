@@ -193,6 +193,29 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree.reset()
 
         for r in waiting_queue:
+            if getattr(r, "disable_radix_match", False):
+                committed_prefix_len = max(
+                    0,
+                    min(
+                        r.kv_committed_len,
+                        max(len(r.logical_fill_ids) - 1, 0),
+                    ),
+                )
+                if r.req_pool_idx is not None and committed_prefix_len > 0:
+                    r.prefix_indices = self.tree_cache.req_to_token_pool.req_to_token[
+                        r.req_pool_idx, :committed_prefix_len
+                    ].to(dtype=torch.int64, copy=True)
+                else:
+                    r.prefix_indices = r.synthetic_prefix_indices[
+                        :committed_prefix_len
+                    ].to(dtype=torch.int64, copy=True)
+                r.cache_protected_len = min(
+                    len(r.synthetic_prefix_indices), len(r.prefix_indices)
+                )
+                r.last_node = None
+                r.last_host_node = None
+                r.host_hit_length = 0
+                continue
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             # NOTE: the prefix_indices must always be aligned with last_node
@@ -261,8 +284,12 @@ class SchedulePolicy:
     ) -> None:
         """Sorts the waiting queue based on a depth-first search weighting."""
         last_node_to_reqs = defaultdict(list)
+        graft_reqs = []
         for req in waiting_queue:
-            last_node_to_reqs[req.last_node].append(req)
+            if getattr(req, "disable_radix_match", False) or req.last_node is None:
+                graft_reqs.append(req)
+            else:
+                last_node_to_reqs[req.last_node].append(req)
 
         node_to_weight = defaultdict(int)
         for node in last_node_to_reqs:
@@ -276,6 +303,7 @@ class SchedulePolicy:
             last_node_to_reqs,
             waiting_queue,
         )
+        waiting_queue.extend(graft_reqs)
 
     @staticmethod
     def _sort_by_longest_output(
@@ -564,6 +592,8 @@ class PrefillAdder:
         self._update_prefill_budget(prefix_len, trunc_len, 0)
 
     def _req_inc_lock_ref(self, req: Req):
+        if getattr(req, "disable_radix_match", False) or req.last_node is None:
+            return
         result = self.tree_cache.inc_lock_ref(req.last_node)
         if self.is_hybrid_swa:
             req.swa_uuid_for_lock = result.swa_uuid_for_lock
@@ -625,6 +655,9 @@ class PrefillAdder:
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
+        if last_node is None:
+            yield None
+            return
         try:
             result = self.tree_cache.inc_lock_ref(last_node)
             if self.tree_cache.supports_swa() and self.tree_cache.is_tree_cache():

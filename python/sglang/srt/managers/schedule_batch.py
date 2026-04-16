@@ -95,6 +95,7 @@ if TYPE_CHECKING:
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+    from sglang.srt.managers.io_struct import KVExportSpec, KVGraftSpec, KVHandleMeta
     from sglang.srt.managers.session_controller import Session
     from sglang.srt.observability.scheduler_metrics_mixin import PrefillStats
     from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -565,10 +566,28 @@ class Req(ReqDllmMixin):
             else origin_input_ids  # Before image padding
         )
         self.origin_input_ids = origin_input_ids
+        self.origin_input_ids_len = len(origin_input_ids)
         # Each decode stage's output ids
         self.output_ids = []
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.fill_ids = []
+        self.synthetic_prefix_token_ids: List[int] = []
+        self.synthetic_prefix_indices: torch.Tensor = torch.empty(
+            (0,), dtype=torch.int64
+        )
+        self.kv_graft_spec: Optional[KVGraftSpec] = None
+        self.kv_export_spec: Optional[KVExportSpec] = None
+        self.disable_radix_match: bool = False
+        self.graft_backend: Optional[str] = None
+        self.graft_export_after_prefill: bool = False
+        self.graft_owned_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
+        self.graft_aliased_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
+        # Tracks synthetic-prefix ownership in the exact concatenation order so
+        # cleanup can free/release the right physical pages even when alias and
+        # transformed segments are interleaved.
+        self.graft_prefix_owned_mask: torch.Tensor = torch.empty((0,), dtype=torch.bool)
+        self.kv_exports: List[KVHandleMeta] = []
+        self.synthetic_prefix_physical_len: int = 0
         self.session = session
         self.input_embeds = input_embeds
 
@@ -835,7 +854,31 @@ class Req(ReqDllmMixin):
     @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
-        return len(self.origin_input_ids) + len(self.output_ids)
+        return self.prompt_token_count + len(self.output_ids)
+
+    @property
+    def prompt_token_count(self) -> int:
+        return len(self.synthetic_prefix_token_ids) + len(self.origin_input_ids)
+
+    @property
+    def logical_input_ids(self) -> List[int]:
+        return self.synthetic_prefix_token_ids + self.origin_input_ids
+
+    @property
+    def logical_fill_ids(self) -> List[int]:
+        return self.synthetic_prefix_token_ids + self.origin_input_ids + self.output_ids
+
+    def get_exportable_logical_token_ids(self, committed_len: Optional[int] = None) -> List[int]:
+        """Return the logical token ids that currently have committed KV.
+
+        The first decode step allocates one extra KV slot for the sampled next token
+        before that token is appended to ``output_ids``. Clamp the returned view to
+        the logical sequence we can reconstruct locally.
+        """
+        if committed_len is None:
+            committed_len = self.kv_committed_len
+        logical_ids = self.logical_fill_ids
+        return logical_ids[: min(committed_len, len(logical_ids))]
 
     @property
     def is_prefill_only(self) -> bool:
@@ -903,7 +946,7 @@ class Req(ReqDllmMixin):
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
         else:
-            self.fill_ids = self.origin_input_ids + self.output_ids
+            self.fill_ids = self.logical_fill_ids
 
         input_len = len(self.fill_ids)
 
@@ -930,7 +973,38 @@ class Req(ReqDllmMixin):
         max_prefix_len = max(max_prefix_len, 0)
         token_ids = self.fill_ids[:max_prefix_len]
 
-        if tree_cache is not None:
+        if self.disable_radix_match:
+            committed_prefix_len = min(self.kv_committed_len, max_prefix_len)
+            if (
+                tree_cache is not None
+                and self.req_pool_idx is not None
+                and committed_prefix_len > 0
+            ):
+                self.prefix_indices = tree_cache.req_to_token_pool.req_to_token[
+                    self.req_pool_idx, :committed_prefix_len
+                ].to(dtype=torch.int64, copy=True)
+            else:
+                self.prefix_indices = self.synthetic_prefix_indices[
+                    :committed_prefix_len
+                ].to(dtype=torch.int64, copy=True)
+            self.cache_protected_len = min(
+                len(self.synthetic_prefix_indices), len(self.prefix_indices)
+            )
+            self.last_node = None
+            self.last_host_node = None
+            self.host_hit_length = 0
+            self.mamba_branching_seqlen = None
+            logger.info(
+                "[kv_graft init_next_round] rid=%s fill_len=%s committed_prefix_len=%s logical_prefix_len=%s physical_prefix_len=%s cache_protected_len=%s output_len=%s",
+                self.rid,
+                len(self.fill_ids),
+                committed_prefix_len,
+                len(self.synthetic_prefix_token_ids),
+                len(self.synthetic_prefix_indices),
+                self.cache_protected_len,
+                len(self.output_ids),
+            )
+        elif tree_cache is not None:
             if cow_mamba is None:
                 cow_mamba = tree_cache.supports_mamba()
             match_result = tree_cache.match_prefix(
@@ -1203,7 +1277,11 @@ class Req(ReqDllmMixin):
             if self.bootstrap_room is not None
             else ""
         )
-        prefix = f"Req Time Stats(rid={self.rid}{bootstrap_info}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.disagg_mode_str()})"
+        prefix = (
+            f"Req Time Stats(rid={self.rid}{bootstrap_info}, "
+            f"input len={self.prompt_token_count}, output len={len(self.output_ids)}, "
+            f"type={self.time_stats.disagg_mode_str()})"
+        )
         logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
         self.has_log_time_stats = True
 
@@ -1515,6 +1593,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
+        for req, ids, pre_len, seq_len, ext_len in zip(reqs, input_ids, prefix_lens, seq_lens, extend_lens):
+            if req.disable_radix_match:
+                logger.info(
+                    "[kv_graft prepare_extend] rid=%s fill_len=%s prefix_len=%s extend_len=%s sliced_input_len=%s logical_prefix_len=%s physical_prefix_len=%s",
+                    req.rid,
+                    len(req.fill_ids),
+                    pre_len,
+                    ext_len,
+                    len(ids),
+                    len(req.synthetic_prefix_token_ids),
+                    len(req.synthetic_prefix_indices),
+                )
 
         # For matryoshka embeddings
         if self.model_config.is_matryoshka and any(
@@ -1647,14 +1737,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     len(req.fill_ids),
                 )
                 if req.logprob_start_len == -1:
-                    logprob_start_len = len(req.origin_input_ids)
+                    logprob_start_len = req.prompt_token_count
                 else:
                     logprob_start_len = req.logprob_start_len
                 # Apply logprob_start_len
                 if global_start_idx < logprob_start_len:
                     global_start_idx = logprob_start_len
 
-                logprob_token_ids = req.origin_input_ids[
+                logprob_token_ids = req.fill_ids[
                     global_start_idx + 1 : global_end_idx + 1
                 ]
                 extend_input_logprob_token_ids.extend(logprob_token_ids)
@@ -1833,7 +1923,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         running_bs = running_batch.batch_size()
 
         for req in running_batch.reqs:
-            req.fill_ids = req.origin_input_ids + req.output_ids
+            req.fill_ids = req.logical_fill_ids
             req.set_extend_input_len(1)
 
         input_ids = torch.cat([self.input_ids, running_batch.input_ids])
@@ -1848,10 +1938,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
         self.prefix_lens.extend(
-            [
-                len(r.origin_input_ids) + len(r.output_ids) + delta
-                for r in running_batch.reqs
-            ]
+            [r.prompt_token_count + len(r.output_ids) + delta for r in running_batch.reqs]
         )
         self.extend_lens.extend([1] * running_bs)
         self.extend_num_tokens += running_bs

@@ -197,6 +197,7 @@ def _handle_output_by_index(output, i):
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),
+            kv_exports=_extract_field_by_index(output, "kv_exports", i),
         )
     elif isinstance(output, BatchEmbeddingOutput):
         new_output = BatchEmbeddingOutput(
@@ -264,6 +265,7 @@ def _handle_output_by_index(output, i):
             output_token_entropy_val=_extract_field_by_index(
                 output, "output_token_entropy_val", i, check_length=False
             ),
+            kv_exports=_extract_field_by_index(output, "kv_exports", i),
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False
             ),

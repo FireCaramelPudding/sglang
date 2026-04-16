@@ -178,6 +178,9 @@ class SchedulerOutputProcessorMixin:
                 if req.is_chunked <= 0:
                     req.time_stats.set_prefill_finished_time()
 
+                    # Export the committed prompt prefix before we fold the first
+                    # sampled token into request-local output state.
+                    self._maybe_register_prefill_graft_export(req)
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
                     req.check_finished()
@@ -187,7 +190,8 @@ class SchedulerOutputProcessorMixin:
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        self.tree_cache.cache_unfinished_req(req)
+                        if not getattr(req, "disable_radix_match", False):
+                            self.tree_cache.cache_unfinished_req(req)
                         if self.enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
@@ -222,7 +226,7 @@ class SchedulerOutputProcessorMixin:
                             logits_output.hidden_states[
                                 hidden_state_offset : (
                                     hidden_state_offset := hidden_state_offset
-                                    + len(req.origin_input_ids)
+                                    + req.prompt_token_count
                                 )
                             ]
                             .cpu()
@@ -452,6 +456,7 @@ class SchedulerOutputProcessorMixin:
                 if req.multimodal_inputs is not None and req.session is None:
                     req.multimodal_inputs.release_features()
                 self.maybe_collect_routed_experts(req)
+                self._maybe_register_kv_export(req)
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
@@ -537,7 +542,7 @@ class SchedulerOutputProcessorMixin:
     def _mamba_prefix_cache_update(
         self, req: Req, batch: ScheduleBatch, result: GenerationBatchResult, i: int
     ) -> None:
-        seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+        seq_len = req.prompt_token_count + len(req.output_ids) - 1
         if req.mamba_ping_pong_track_buffer is not None:
             mamba_track_interval = get_global_server_args().mamba_track_interval
             if batch.spec_algorithm.is_none() and seq_len % mamba_track_interval == 0:
@@ -922,6 +927,7 @@ class SchedulerOutputProcessorMixin:
         load = self.get_load()
         routed_experts = None
         customized_info = {}
+        kv_exports = []
 
         time_stats = []
 
@@ -1010,7 +1016,7 @@ class SchedulerOutputProcessorMixin:
                     req.sampling_params.spaces_between_special_tokens
                 )
                 no_stop_trim.append(req.sampling_params.no_stop_trim)
-                prompt_tokens.append(len(req.origin_input_ids))
+                prompt_tokens.append(req.prompt_token_count)
                 completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
 
@@ -1020,6 +1026,7 @@ class SchedulerOutputProcessorMixin:
                 retraction_counts.append(req.retraction_count)
 
                 time_stats.append(req.time_stats)
+                kv_exports.append(req.kv_exports or [])
 
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
@@ -1163,6 +1170,7 @@ class SchedulerOutputProcessorMixin:
                     retraction_counts=retraction_counts,
                     load=load,
                     dp_ranks=dp_ranks,
+                    kv_exports=kv_exports,
                 )
             )
 
@@ -1183,7 +1191,7 @@ class SchedulerOutputProcessorMixin:
                 http_worker_ipcs.append(req.http_worker_ipc)
                 finished_reasons.append(req.finished_reason.to_json())
                 embeddings.append(req.embedding)
-                prompt_tokens.append(len(req.origin_input_ids))
+                prompt_tokens.append(req.prompt_token_count)
                 cached_tokens.append(req.cached_tokens)
 
                 # Collect detailed cache breakdown if available

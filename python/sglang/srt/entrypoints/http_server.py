@@ -57,7 +57,7 @@ from fastapi import (
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
@@ -129,8 +129,11 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     PinPrefixReqInput,
     ProfileReqInput,
+    ReleaseKVHandlesReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
+    GetKVHandleReqInput,
+    GetKVHandleTensorsReqInput,
     SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
@@ -184,6 +187,9 @@ from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+
+# Keep existing response call sites while avoiding FastAPI's deprecated ORJSONResponse.
+ORJSONResponse = SGLangORJSONResponse
 
 # Global constants
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
@@ -744,6 +750,67 @@ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
     return Response(
         content=content,
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.post("/kv_handles/release")
+async def release_kv_handles(obj: ReleaseKVHandlesReqInput):
+    ret = await _global_state.tokenizer_manager.release_kv_handles(obj.handles)
+    status = 200 if ret.success else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(
+        status_code=status,
+        content={
+            "success": ret.success,
+            "released_handles": ret.released_handles,
+            "missing_handles": ret.missing_handles,
+            "message": ret.message,
+        },
+    )
+
+
+@app.get("/kv_handles/{handle}")
+async def get_kv_handle(handle: str):
+    ret = await _global_state.tokenizer_manager.get_kv_handle(handle)
+    status = 200 if ret.success else HTTPStatus.NOT_FOUND
+    return ORJSONResponse(
+        status_code=status,
+        content={
+            "success": ret.success,
+            "handle_meta": (
+                dataclasses.asdict(ret.handle_meta) if ret.handle_meta is not None else None
+            ),
+            "message": ret.message,
+        },
+    )
+
+
+@app.get("/kv_handles/{handle}/tensors")
+async def get_kv_handle_tensors(
+    handle: str,
+    layer_ids: Optional[str] = Query(default=None),
+    include_values: bool = Query(default=True),
+):
+    parsed_layer_ids = None
+    if layer_ids:
+        parsed_layer_ids = [int(x) for x in layer_ids.split(",") if x.strip()]
+    ret = await _global_state.tokenizer_manager.get_kv_handle_tensors(
+        handle=handle,
+        layer_ids=parsed_layer_ids,
+        include_values=include_values,
+    )
+    status = 200 if ret.success else HTTPStatus.NOT_FOUND
+    return ORJSONResponse(
+        status_code=status,
+        content={
+            "success": ret.success,
+            "handle_meta": (
+                dataclasses.asdict(ret.handle_meta) if ret.handle_meta is not None else None
+            ),
+            "device_indices": ret.device_indices,
+            "token_ids": ret.token_ids,
+            "layers": ret.layers,
+            "message": ret.message,
+        },
     )
 
 

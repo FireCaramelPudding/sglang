@@ -59,6 +59,8 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     FreezeGCReq,
     GenerateReqInput,
+    KVGraftSpec,
+    KVExportSpec,
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
@@ -977,6 +979,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 priority=obj.priority,
                 extra_key=obj.extra_key,
                 routing_key=obj.routing_key,
+                kv_graft=(
+                    KVGraftSpec(**obj.kv_graft)
+                    if isinstance(obj.kv_graft, dict)
+                    else obj.kv_graft
+                ),
+                kv_export=(
+                    KVExportSpec(**obj.kv_export)
+                    if isinstance(obj.kv_export, dict)
+                    else obj.kv_export
+                ),
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
             )
@@ -1176,6 +1188,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     out["text"] = "".join(chunk["text"] for chunk in out_list)
             else:
                 out = out_list[-1]
+
+            if "meta_info" in out and "kv_exports" in out["meta_info"]:
+                out["kv_exports"] = out["meta_info"]["kv_exports"]
 
             if finished:
                 # For non-streaming cases, response has not been sent yet (`response_sent_to_client_time` has not been set yet).
@@ -1597,6 +1612,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     meta_info[k] = v[i]
             if getattr(recv_obj, "dp_ranks", None):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
+            if getattr(recv_obj, "kv_exports", None):
+                exports = recv_obj.kv_exports[i]
+                if exports is not None:
+                    meta_info["kv_exports"] = [
+                        dataclasses.asdict(item) for item in exports
+                    ]
 
             if isinstance(recv_obj, BatchStrOutput):
                 state.text += recv_obj.output_strs[i]

@@ -315,6 +315,10 @@ class CompletionRequest(BaseModel):
     # Priority for the request
     priority: Optional[int] = None
 
+    # Cross-context KV graft / export
+    sgl_kv_graft: Optional[Dict[str, Any]] = None
+    sgl_kv_export: Optional[Dict[str, Any]] = None
+
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
 
@@ -340,6 +344,7 @@ class SglExt(BaseModel):
 
     routed_experts: Optional[str] = None
     cached_tokens_details: Optional[CachedTokensDetails] = None
+    sgl_kv_exports: Optional[Any] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -632,6 +637,10 @@ class ChatCompletionRequest(BaseModel):
     cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
+
+    # Cross-context KV graft / export
+    sgl_kv_graft: Optional[Dict[str, Any]] = None
+    sgl_kv_export: Optional[Dict[str, Any]] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
@@ -1199,6 +1208,10 @@ class ResponsesRequest(BaseModel):
     top_k: int = -1
     min_p: float = 0.0
     repetition_penalty: float = 1.0
+
+    # Cross-context KV graft / export
+    sgl_kv_graft: Optional[Dict[str, Any]] = None
+    sgl_kv_export: Optional[Dict[str, Any]] = None
 
     # Default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {

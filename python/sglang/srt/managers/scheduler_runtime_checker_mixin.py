@@ -5,6 +5,8 @@ import time
 import warnings
 from typing import TYPE_CHECKING
 
+import torch
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -21,6 +23,28 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerRuntimeCheckerMixin:
+    def _external_held_tokens(self: Scheduler) -> int:
+        registry = getattr(self, "kv_handle_registry", None)
+        if registry is not None:
+            return registry.external_uncached_size(self.tree_cache)
+
+        allocator = getattr(self, "token_to_kv_pool_allocator", None)
+        if allocator is None:
+            return 0
+        getter = getattr(allocator, "external_held_size", None)
+        if getter is None:
+            return 0
+        return getter()
+
+    def _external_cached_held_tokens(self: Scheduler) -> int:
+        registry = getattr(self, "kv_handle_registry", None)
+        if registry is None:
+            return 0
+        getter = getattr(registry, "external_cached_size", None)
+        if getter is None:
+            return 0
+        return getter(self.tree_cache)
+
     def _session_held_tokens(self: Scheduler) -> int:
         if isinstance(self.tree_cache, SessionAwareCache):
             return self.tree_cache.session_held_tokens()
@@ -184,11 +208,315 @@ class SchedulerRuntimeCheckerMixin:
         _, _, available_size, evictable_size = self._get_token_info()
         protected_size = self.tree_cache.protected_size()
         session_held = self._session_held_tokens()
-        memory_leak = (available_size + evictable_size) != (
-            self.max_total_num_tokens - protected_size - session_held
+        external_uncached_held = self._external_held_tokens()
+        external_cached_held = self._external_cached_held_tokens()
+        effective_evictable_size = evictable_size
+        expected_free_or_evictable = (
+            self.max_total_num_tokens
+            - protected_size
+            - session_held
+            - external_uncached_held
         )
-        token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}, {session_held=}\n"
+        if protected_size == 0 and session_held == 0 and external_cached_held > 0:
+            effective_evictable_size = max(0, evictable_size - external_cached_held)
+            expected_free_or_evictable -= external_cached_held
+        memory_leak = (available_size + effective_evictable_size) != expected_free_or_evictable
+        token_msg = (
+            f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, "
+            f"{protected_size=}, {session_held=}, "
+            f"{external_uncached_held=}, {external_cached_held=}, "
+            f"{effective_evictable_size=}\n"
+        )
+        if memory_leak:
+            allocator = getattr(self, "token_to_kv_pool_allocator", None)
+            if allocator is not None:
+                deduped = self._dedupe_allocator_free_items(allocator)
+                if deduped > 0:
+                    available_size = self.token_to_kv_pool_allocator.available_size()
+                    memory_leak = (
+                        available_size + effective_evictable_size
+                    ) != expected_free_or_evictable
+                    token_msg += (
+                        f"auto_deduped_free_items={deduped}, {available_size=}\n"
+                    )
+                if memory_leak and (
+                    available_size + effective_evictable_size
+                ) > expected_free_or_evictable:
+                    purged = self._purge_allocator_free_conflicts(allocator)
+                    if purged > 0:
+                        available_size = self.token_to_kv_pool_allocator.available_size()
+                        memory_leak = (
+                            available_size + effective_evictable_size
+                        ) != expected_free_or_evictable
+                        token_msg += (
+                            f"auto_purged_conflicting_free_items={purged}, {available_size=}\n"
+                        )
+                hold_counts = getattr(allocator, "external_hold_counts", None)
+                pending_counts = getattr(allocator, "pending_free_counts", None)
+                if hold_counts is not None and pending_counts is not None:
+                    held_items = int((hold_counts > 0).sum().item())
+                    pending_items = int((pending_counts > 0).sum().item())
+                    ready_pending_items = int(
+                        ((pending_counts > 0) & (hold_counts == 0)).sum().item()
+                    )
+                    token_msg += (
+                        f"allocator_debug: held_items={held_items}, "
+                        f"pending_items={pending_items}, "
+                        f"ready_pending_items={ready_pending_items}\n"
+                    )
+                leaked_items_full = self._collect_radix_leaked_items_for_debug(
+                    allocator, sample_limit=None
+                )
+                if leaked_items_full:
+                    reclaimed = self._reclaim_radix_orphan_items(
+                        allocator, leaked_items_full
+                    )
+                    if reclaimed > 0:
+                        # Re-evaluate after reclaiming orphan items.
+                        available_size = self.token_to_kv_pool_allocator.available_size()
+                        external_uncached_held = self._external_held_tokens()
+                        external_cached_held = self._external_cached_held_tokens()
+                        effective_evictable_size = evictable_size
+                        expected_free_or_evictable = (
+                            self.max_total_num_tokens
+                            - protected_size
+                            - session_held
+                            - external_uncached_held
+                        )
+                        if (
+                            protected_size == 0
+                            and session_held == 0
+                            and external_cached_held > 0
+                        ):
+                            effective_evictable_size = max(
+                                0, evictable_size - external_cached_held
+                            )
+                            expected_free_or_evictable -= external_cached_held
+                        memory_leak = (
+                            available_size + effective_evictable_size
+                        ) != expected_free_or_evictable
+                        token_msg += (
+                            f"auto_reclaimed_orphan_items={reclaimed}, "
+                            f"{available_size=}, {external_uncached_held=}, "
+                            f"{external_cached_held=}, {effective_evictable_size=}\n"
+                        )
+                        if memory_leak and (
+                            available_size + effective_evictable_size
+                        ) > expected_free_or_evictable:
+                            purged = self._purge_allocator_free_conflicts(allocator)
+                            if purged > 0:
+                                available_size = (
+                                    self.token_to_kv_pool_allocator.available_size()
+                                )
+                                memory_leak = (
+                                    available_size + effective_evictable_size
+                                ) != expected_free_or_evictable
+                                token_msg += (
+                                    "auto_purged_conflicting_free_items_after_reclaim="
+                                    f"{purged}, {available_size=}\n"
+                                )
+                leaked_items = self._collect_radix_leaked_items_for_debug(
+                    allocator, sample_limit=64
+                )
+                if leaked_items is not None:
+                    token_msg += f"leaked_items_sample={leaked_items}\n"
         return memory_leak, token_msg
+
+    def _collect_radix_leaked_items_for_debug(
+        self: Scheduler, allocator, sample_limit: int | None = 64
+    ) -> list[int] | None:
+        try:
+            hold_counts = getattr(allocator, "external_hold_counts", None)
+            if hold_counts is None:
+                return None
+            num_items = int(hold_counts.numel())
+            if num_items <= 1:
+                return None
+
+            expected = set(range(1, num_items))
+
+            free_items = set()
+            for attr in ("free_pages", "release_pages"):
+                pages = getattr(allocator, attr, None)
+                if pages is None:
+                    continue
+                if len(pages) == 0:
+                    continue
+                free_items.update(int(x) for x in pages.tolist())
+
+            cached_items = set()
+            flatten_fn = getattr(self.tree_cache, "all_values_flatten", None)
+            if callable(flatten_fn):
+                try:
+                    cached = flatten_fn()
+                    if cached is not None and cached.numel() > 0:
+                        cached = cached.to(device=allocator.device, dtype=torch.int64)
+                        if allocator.page_size > 1:
+                            cached = cached // allocator.page_size
+                        cached_items.update(int(x) for x in torch.unique(cached).tolist())
+                except Exception:
+                    pass
+
+            held_items = set(
+                int(x)
+                for x in torch.nonzero(hold_counts > 0, as_tuple=False).flatten().tolist()
+                if int(x) > 0
+            )
+
+            leaked = sorted(expected - free_items - cached_items - held_items)
+            if not leaked:
+                return []
+            if sample_limit is None:
+                return leaked
+            return leaked[:sample_limit]
+        except Exception:
+            return None
+
+    def _purge_allocator_free_conflicts(self: Scheduler, allocator) -> int:
+        """Remove invalid/conflicting items from allocator free lists.
+
+        When memory accounting is higher than expected, it usually means some items are
+        counted as "free" while still being referenced by the cache or held externally.
+        This helper removes such items from the allocator free pages to avoid double
+        counting (and potential double-allocation).
+        """
+        try:
+            free_pages = getattr(allocator, "free_pages", None)
+            release_pages = getattr(allocator, "release_pages", None)
+            if free_pages is None or release_pages is None:
+                return 0
+
+            hold_counts = getattr(allocator, "external_hold_counts", None)
+            if hold_counts is None:
+                return 0
+
+            # Normalize to allocator device/dtype.
+            free_pages = free_pages.to(device=allocator.device, dtype=torch.int64)
+            release_pages = release_pages.to(device=allocator.device, dtype=torch.int64)
+
+            before = len(free_pages) + len(release_pages)
+
+            # Valid allocator items are [1, num_items - 1]. (0 is padded dummy slot.)
+            num_items = int(hold_counts.numel())
+            if num_items <= 1:
+                return 0
+            valid_min = 1
+            valid_max = num_items - 1
+            if len(free_pages) > 0:
+                free_pages = free_pages[
+                    (free_pages >= valid_min) & (free_pages <= valid_max)
+                ]
+            if len(release_pages) > 0:
+                release_pages = release_pages[
+                    (release_pages >= valid_min) & (release_pages <= valid_max)
+                ]
+
+            held_items = torch.nonzero(hold_counts > 0, as_tuple=False).flatten().to(
+                device=allocator.device, dtype=torch.int64
+            )
+            if held_items.numel() > 0:
+                held_items = held_items[held_items > 0]
+
+            cached_items = torch.empty((0,), dtype=torch.int64, device=allocator.device)
+            flatten_fn = getattr(self.tree_cache, "all_values_flatten", None)
+            if callable(flatten_fn):
+                try:
+                    cached = flatten_fn()
+                    if cached is not None and cached.numel() > 0:
+                        cached = cached.to(device=allocator.device, dtype=torch.int64)
+                        if allocator.page_size > 1:
+                            cached = cached // allocator.page_size
+                        cached_items = torch.unique(cached)
+                        if cached_items.numel() > 0:
+                            cached_items = cached_items[cached_items > 0]
+                except Exception:
+                    cached_items = torch.empty(
+                        (0,), dtype=torch.int64, device=allocator.device
+                    )
+
+            conflict_parts = []
+            if held_items.numel() > 0:
+                conflict_parts.append(held_items)
+            if cached_items.numel() > 0:
+                conflict_parts.append(cached_items)
+            if conflict_parts:
+                conflicts = torch.unique(torch.cat(conflict_parts))
+                if len(free_pages) > 0:
+                    free_pages = free_pages[~torch.isin(free_pages, conflicts)]
+                if len(release_pages) > 0:
+                    release_pages = release_pages[~torch.isin(release_pages, conflicts)]
+
+            allocator.free_pages = free_pages
+            allocator.release_pages = release_pages
+
+            after = len(free_pages) + len(release_pages)
+            purged = before - after
+            if purged > 0:
+                logger.warning(
+                    "Purged allocator free items conflicting with cache/holds during idle self-check: %d",
+                    purged,
+                )
+            return purged
+        except Exception:
+            return 0
+
+    def _reclaim_radix_orphan_items(
+        self: Scheduler, allocator, leaked_items: list[int]
+    ) -> int:
+        if not leaked_items:
+            return 0
+        append_fn = getattr(allocator, "_append_freed_items", None)
+        if append_fn is None:
+            return 0
+        try:
+            leaked_tensor = torch.tensor(
+                leaked_items, dtype=torch.int64, device=allocator.device
+            )
+            append_fn(leaked_tensor)
+            logger.warning(
+                "Recovered orphan KV allocator items during idle self-check: %d",
+                len(leaked_items),
+            )
+            return len(leaked_items)
+        except Exception:
+            return 0
+
+    def _dedupe_allocator_free_items(self: Scheduler, allocator) -> int:
+        try:
+            free_pages = getattr(allocator, "free_pages", None)
+            release_pages = getattr(allocator, "release_pages", None)
+            if free_pages is None or release_pages is None:
+                return 0
+
+            before = len(free_pages) + len(release_pages)
+
+            if len(free_pages) > 0:
+                free_pages = torch.unique(free_pages.to(dtype=torch.int64))
+            else:
+                free_pages = free_pages.to(dtype=torch.int64)
+
+            if len(release_pages) > 0:
+                release_pages = torch.unique(release_pages.to(dtype=torch.int64))
+                if len(free_pages) > 0:
+                    release_pages = release_pages[
+                        ~torch.isin(release_pages, free_pages)
+                    ]
+            else:
+                release_pages = release_pages.to(dtype=torch.int64)
+
+            allocator.free_pages = free_pages
+            allocator.release_pages = release_pages
+
+            after = len(free_pages) + len(release_pages)
+            deduped = before - after
+            if deduped > 0:
+                logger.warning(
+                    "Deduplicated allocator free items during idle self-check: %d",
+                    deduped,
+                )
+            return deduped
+        except Exception:
+            return 0
 
     def _get_batch_uncached_size(self: Scheduler, batch: ScheduleBatch) -> int:
         ret = 0
@@ -236,12 +564,14 @@ class SchedulerRuntimeCheckerMixin:
             logger.info(log_msg)
 
         session_held = self._session_held_tokens()
+        external_uncached_held = self._external_held_tokens()
         total_tokens = (
             available_size
             + evictable_size
             + protected_size
             + uncached_size
             + session_held
+            + external_uncached_held
         )
         assert (
             total_tokens == self.max_total_num_tokens

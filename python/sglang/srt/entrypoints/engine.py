@@ -59,6 +59,8 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
+    GetKVHandleReqOutput,
+    GetKVHandleTensorsReqOutput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
@@ -66,6 +68,7 @@ from sglang.srt.managers.io_struct import (
     MultimodalDataInputFormat,
     OpenSessionReqInput,
     ReleaseMemoryOccupationReqInput,
+    ReleaseKVHandlesReqOutput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
@@ -301,6 +304,8 @@ class Engine(EngineBase):
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
+        kv_graft: Optional[Dict] = None,
+        kv_export: Optional[Dict] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -335,6 +340,8 @@ class Engine(EngineBase):
             rid=rid,
             session_params=session_params,
             priority=priority,
+            kv_graft=kv_graft,
+            kv_export=kv_export,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -391,6 +398,8 @@ class Engine(EngineBase):
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
+        kv_graft: Optional[Dict] = None,
+        kv_export: Optional[Dict] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -425,6 +434,8 @@ class Engine(EngineBase):
             rid=rid,
             session_params=session_params,
             priority=priority,
+            kv_graft=kv_graft,
+            kv_export=kv_export,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -491,6 +502,22 @@ class Engine(EngineBase):
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
         return await generator.__anext__()
+
+    def release_kv_handles(self, handles: List[str]) -> ReleaseKVHandlesReqOutput:
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.release_kv_handles(handles)
+        )
+
+    async def async_release_kv_handles(
+        self, handles: List[str]
+    ) -> ReleaseKVHandlesReqOutput:
+        return await self.tokenizer_manager.release_kv_handles(handles)
+
+    def get_kv_handle(self, handle: str) -> GetKVHandleReqOutput:
+        return self.loop.run_until_complete(self.tokenizer_manager.get_kv_handle(handle))
+
+    async def async_get_kv_handle(self, handle: str) -> GetKVHandleReqOutput:
+        return await self.tokenizer_manager.get_kv_handle(handle)
 
     def rerank(
         self,

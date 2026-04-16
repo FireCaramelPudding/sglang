@@ -19,6 +19,7 @@
 
 import logging
 import math
+import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import torch
@@ -109,6 +110,33 @@ _is_npu = is_npu()
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+
+
+def _maybe_dump_moe_topk_ids(
+    layer_id: int, hidden_states: torch.Tensor, topk_output: Any, state_holder: Any
+) -> None:
+    topk_ids_dir = os.getenv("SGLANG_MOE_TOPK_IDS_DIR")
+    if not topk_ids_dir or get_tensor_model_parallel_rank() != 0:
+        return
+
+    if hasattr(torch, "compiler") and torch.compiler.is_compiling():
+        return
+
+    min_tokens = int(os.getenv("SGLANG_MOE_TOPK_IDS_MIN_TOKENS", "4096"))
+    if hidden_states.shape[0] < min_tokens:
+        return
+
+    max_per_layer = int(os.getenv("SGLANG_MOE_TOPK_IDS_MAX_PER_LAYER", "2"))
+    save_idx = getattr(state_holder, "_topk_ids_save_idx", 0)
+    setattr(state_holder, "_topk_ids_save_idx", save_idx + 1)
+    if save_idx >= max_per_layer:
+        return
+
+    topk_ids_path = os.path.join(
+        topk_ids_dir, f"topk_ids_layer{layer_id}_idx{save_idx}.pt"
+    )
+    torch.save(topk_output.topk_ids.detach().cpu(), topk_ids_path)
+    logger.info("Saved MoE topk_ids to %s", topk_ids_path)
 
 
 def compute_yarn_parameters(
@@ -323,6 +351,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
+        _maybe_dump_moe_topk_ids(self.layer_id, hidden_states, topk_output, self)
         final_hidden_states = self.experts(hidden_states, topk_output)
 
         if self.ep_size > 1 and not should_allreduce_fusion:

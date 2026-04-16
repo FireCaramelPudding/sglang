@@ -448,11 +448,7 @@ class DecodePreallocQueue:
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
-            required_tokens_for_request = (
-                len(req.origin_input_ids)
-                + len(req.output_ids)
-                + self.num_reserved_decode_tokens
-            )
+            required_tokens_for_request = req.seqlen + self.num_reserved_decode_tokens
             if required_tokens_for_request > allocatable_tokens:
                 break
 
@@ -620,10 +616,7 @@ class DecodePreallocQueue:
 
         # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
         # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
-        retractable_tokens = sum(
-            len(r.origin_input_ids) + len(r.output_ids)
-            for r in self.scheduler.running_batch.reqs
-        )
+        retractable_tokens = sum(r.seqlen for r in self.scheduler.running_batch.reqs)
         allocatable_tokens = self._allocatable_tokens(
             retractable_tokens=retractable_tokens, count_retracted=True
         )
@@ -657,15 +650,15 @@ class DecodePreallocQueue:
 
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
-            origin_input_len = len(decode_req.req.origin_input_ids)
+            logical_prompt_len = decode_req.req.prompt_token_count
             required_tokens_for_request = (
-                origin_input_len + self.num_reserved_decode_tokens
+                logical_prompt_len + self.num_reserved_decode_tokens
             )
 
             if (
                 max(
                     required_tokens_for_request,
-                    origin_input_len
+                    logical_prompt_len
                     + min(
                         decode_req.req.sampling_params.max_new_tokens,
                         CLIP_MAX_NEW_TOKEN,
@@ -683,7 +676,7 @@ class DecodePreallocQueue:
 
             kv_indices = (
                 self.req_to_token_pool.req_to_token[decode_req.req.req_pool_idx][
-                    : len(decode_req.req.origin_input_ids)
+                    : decode_req.req.prompt_token_count
                 ]
                 .cpu()
                 .numpy()
@@ -702,7 +695,7 @@ class DecodePreallocQueue:
                 ]
             elif isinstance(self.token_to_kv_pool, SWAKVPool):
                 # SWA hybrid model: send decode-side SWA window indices
-                seq_len = len(decode_req.req.origin_input_ids)
+                seq_len = decode_req.req.prompt_token_count
                 window_size = self.scheduler.sliding_window_size
 
                 window_start = max(0, seq_len - window_size)
@@ -720,7 +713,7 @@ class DecodePreallocQueue:
                 state_indices = window_kv_indices_swa.cpu().numpy()
                 state_indices = kv_to_page_indices(state_indices, page_size)
             elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
-                seq_len = len(decode_req.req.origin_input_ids)
+                seq_len = decode_req.req.prompt_token_count
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx, :seq_len
                 ]
@@ -760,7 +753,7 @@ class DecodePreallocQueue:
             max(
                 [
                     min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
-                    + len(x.origin_input_ids)
+                    + x.prompt_token_count
                     - retractable_tokens
                     for x in self.scheduler.running_batch.reqs
                 ]
@@ -795,9 +788,7 @@ class DecodePreallocQueue:
         if count_retracted:
             allocatable_tokens -= sum(
                 [
-                    len(req.origin_input_ids)
-                    + len(req.output_ids)
-                    + self.num_reserved_decode_tokens
+                    req.seqlen + self.num_reserved_decode_tokens
                     for req in self.retracted_queue
                 ]
             )
@@ -812,7 +803,7 @@ class DecodePreallocQueue:
         ), "req_pool_indices is full! There is a bug in memory estimation."
 
         # Alloc all tokens for the prebuilt req (except for the reserved input token for decoding)
-        fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        fill_len = req.prompt_token_count + max(len(req.output_ids) - 1, 0)
         req.kv_allocated_len = fill_len
         req.kv_committed_len = fill_len
         if self.token_to_kv_pool_allocator.page_size == 1:
@@ -835,7 +826,7 @@ class DecodePreallocQueue:
         self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
 
         # populate metadata
-        req.fill_ids = req.origin_input_ids + req.output_ids
+        req.fill_ids = req.logical_fill_ids
         req.set_extend_input_len(len(req.fill_ids))
 
         return kv_loc

@@ -161,6 +161,17 @@ class OpenAIServingBase(ABC):
                 parts.append(value)
         return "".join(parts) if parts else None
 
+    def _get_sgl_kv_fields(
+        self, request: Any
+    ) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        return (
+            getattr(request, "sgl_kv_graft", None),
+            getattr(request, "sgl_kv_export", None),
+        )
+
+    def _extract_kv_exports_from_ret(self, ret_item: Dict[str, Any]) -> Optional[Any]:
+        return ret_item.get("meta_info", {}).get("kv_exports")
+
     @abstractmethod
     def _convert_to_internal_request(
         self,

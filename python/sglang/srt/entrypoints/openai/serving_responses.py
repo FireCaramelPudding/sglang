@@ -285,6 +285,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                         rid=request.request_id,
                         extra_key=self._compute_extra_key(request),
                         background=request.background,
+                        kv_graft=self._get_sgl_kv_fields(request)[0],
+                        kv_export=self._get_sgl_kv_fields(request)[1],
                     )
 
                     generator = self._generate_with_builtin_tools(
@@ -492,6 +494,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                 num_generated_tokens = 0
                 num_cached_tokens = 0
                 num_reasoning_tokens = 0
+
+            kv_exports = final_res.get("meta_info", {}).get("kv_exports")
+            if kv_exports:
+                metadata = request.metadata.copy() if request.metadata else {}
+                metadata["sgl_kv_exports"] = kv_exports
+                request.metadata = metadata
 
         usage = UsageInfo(
             prompt_tokens=num_prompt_tokens,
@@ -1307,6 +1315,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 return_text_in_logprobs=adapted_request.return_text_in_logprobs,
                 return_hidden_states=adapted_request.return_hidden_states,
                 background=adapted_request.background,
+                kv_graft=adapted_request.kv_graft,
+                kv_export=adapted_request.kv_export,
             )
 
             # Update sampling params with reduced max_tokens

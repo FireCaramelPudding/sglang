@@ -3,6 +3,7 @@ import argparse
 import dataclasses
 import json
 import os
+import re
 import time
 from contextlib import nullcontext
 from datetime import datetime
@@ -39,6 +40,8 @@ from sglang.srt.server_args import (
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
+_TOPK_IDS_FILE_PATTERN = re.compile(r"topk_ids_layer(\d+)_idx(\d+)\.pt$")
+_TOPK_IDS_FILE_CACHE: Dict[str, List[str]] = {}
 
 
 @dataclasses.dataclass
@@ -116,13 +119,34 @@ class KernelWrapper:
         return time_cost
 
 
+def _list_topk_ids_files(topk_ids_dir: str) -> List[str]:
+    cached = _TOPK_IDS_FILE_CACHE.get(topk_ids_dir)
+    if cached is not None:
+        return cached
+
+    entries: List[Tuple[int, int, str]] = []
+    for filename in os.listdir(topk_ids_dir):
+        match = _TOPK_IDS_FILE_PATTERN.fullmatch(filename)
+        if match is None:
+            continue
+        layer_id = int(match.group(1))
+        sample_idx = int(match.group(2))
+        entries.append((sample_idx, layer_id, os.path.join(topk_ids_dir, filename)))
+
+    if not entries:
+        raise FileNotFoundError(
+            f"No topk_ids_layer*.pt files found under {topk_ids_dir}"
+        )
+
+    entries.sort()
+    paths = [path for _, _, path in entries]
+    _TOPK_IDS_FILE_CACHE[topk_ids_dir] = paths
+    return paths
+
+
 def load_topk_ids(topk_ids_dir, i: int):
-    num_layers = 61
-    dense_layers = 3
-    moe_layers = num_layers - dense_layers
-    return torch.load(
-        f"{topk_ids_dir}/topk_ids_layer{i % moe_layers + dense_layers}_idx{i // moe_layers}.pt"
-    )
+    topk_id_files = _list_topk_ids_files(os.path.abspath(topk_ids_dir))
+    return torch.load(topk_id_files[i % len(topk_id_files)], map_location="cpu")
 
 
 def benchmark_config(

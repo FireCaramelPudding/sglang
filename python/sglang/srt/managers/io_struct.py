@@ -130,6 +130,82 @@ MultimodalDataInputFormat = Union[
 
 
 @dataclass
+class KVTransformSpec:
+    rope_shift: Literal["off", "on", "auto"] = "off"
+    rescale_profile: Optional[str] = None
+    rescale_params: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class KVGraftSegment:
+    handle: str
+    token_start: Optional[int] = None
+    token_end: Optional[int] = None
+    origin_start: int = 0
+    transform: Optional[KVTransformSpec] = None
+
+    def __post_init__(self):
+        if self.token_start is not None and self.token_start < 0:
+            raise ValueError("token_start must be >= 0")
+        if self.token_end is not None and self.token_end < 0:
+            raise ValueError("token_end must be >= 0")
+        if (
+            self.token_start is not None
+            and self.token_end is not None
+            and self.token_end < self.token_start
+        ):
+            raise ValueError("token_end must be >= token_start")
+
+
+@dataclass
+class KVGraftSpec:
+    segments: List[KVGraftSegment]
+
+    def __post_init__(self):
+        if not self.segments:
+            raise ValueError("kv_graft.segments must not be empty")
+
+
+@dataclass
+class KVExportSpec:
+    token_start: Optional[int] = None
+    token_end: Optional[int] = None
+    origin_start: int = 0
+    persist: bool = True
+    ttl_seconds: int = 300
+    name: Optional[str] = None
+
+    def __post_init__(self):
+        if self.token_start is not None and self.token_start < 0:
+            raise ValueError("token_start must be >= 0")
+        if self.token_end is not None and self.token_end < 0:
+            raise ValueError("token_end must be >= 0")
+        if (
+            self.token_start is not None
+            and self.token_end is not None
+            and self.token_end < self.token_start
+        ):
+            raise ValueError("token_end must be >= token_start")
+        if self.ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be positive")
+
+
+@dataclass
+class KVHandleMeta:
+    handle: str
+    backend: str
+    token_count: int
+    origin_start: int
+    dtype: str
+    model_key: str
+    composite: bool = False
+    created_from_rid: Optional[str] = None
+    ttl_seconds: int = 300
+    name: Optional[str] = None
+    transform: Optional[KVTransformSpec] = None
+
+
+@dataclass
 class GenerateReqInput(BaseReq):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
@@ -224,6 +300,10 @@ class GenerateReqInput(BaseReq):
 
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
+
+    # Cross-context KV graft / export
+    kv_graft: Optional[Union[KVGraftSpec, Dict[str, Any]]] = None
+    kv_export: Optional[Union[KVExportSpec, Dict[str, Any]]] = None
 
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
@@ -659,6 +739,8 @@ class GenerateReqInput(BaseReq):
             extra_key=self.extra_key,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
+            kv_graft=self.kv_graft,
+            kv_export=self.kv_export,
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
             external_trace_header=self.external_trace_header,
@@ -736,6 +818,10 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
+
+    # Cross-context KV graft / export
+    kv_graft: Optional[KVGraftSpec] = None
+    kv_export: Optional[KVExportSpec] = None
 
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
@@ -1018,6 +1104,9 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[int]] = None
 
+    # Exported KV handles for each request
+    kv_exports: Optional[List[List[KVHandleMeta]]] = None
+
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
@@ -1079,6 +1168,9 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[int]] = None
+
+    # Exported KV handles for each request
+    kv_exports: Optional[List[List[KVHandleMeta]]] = None
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
@@ -1193,6 +1285,48 @@ class PinPrefixReqInput(BaseReq):
 class PinPrefixReqOutput(BaseReq):
     success: bool
     nodes_pinned: int = 0
+    message: str = ""
+
+
+@dataclass
+class ReleaseKVHandlesReqInput(BaseReq):
+    handles: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ReleaseKVHandlesReqOutput(BaseReq):
+    success: bool
+    released_handles: List[str] = field(default_factory=list)
+    missing_handles: List[str] = field(default_factory=list)
+    message: str = ""
+
+
+@dataclass
+class GetKVHandleReqInput(BaseReq):
+    handle: str = ""
+
+
+@dataclass
+class GetKVHandleReqOutput(BaseReq):
+    success: bool
+    handle_meta: Optional[KVHandleMeta] = None
+    message: str = ""
+
+
+@dataclass
+class GetKVHandleTensorsReqInput(BaseReq):
+    handle: str = ""
+    layer_ids: Optional[List[int]] = None
+    include_values: bool = True
+
+
+@dataclass
+class GetKVHandleTensorsReqOutput(BaseReq):
+    success: bool
+    handle_meta: Optional[KVHandleMeta] = None
+    device_indices: List[int] = field(default_factory=list)
+    token_ids: List[int] = field(default_factory=list)
+    layers: List[Dict[str, Any]] = field(default_factory=list)
     message: str = ""
 
 

@@ -107,6 +107,10 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    GetKVHandleReqInput,
+    GetKVHandleReqOutput,
+    GetKVHandleTensorsReqInput,
+    GetKVHandleTensorsReqOutput,
     GetLoadReqInput,
     GetLoadsReqInput,
     GetWeightsByNameReqInput,
@@ -114,6 +118,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
+    KVExportSpec,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
@@ -123,6 +128,8 @@ from sglang.srt.managers.io_struct import (
     PinPrefixReqInput,
     PinPrefixReqOutput,
     ProfileReq,
+    ReleaseKVHandlesReqInput,
+    ReleaseKVHandlesReqOutput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -142,6 +149,12 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
+from sglang.srt.managers.kv_graft_materializer import (
+    MHAGraftMaterializer,
+    MLAGraftMaterializer,
+    resolve_rope_theta_from_hf_config,
+)
+from sglang.srt.managers.kv_handle_registry import KVHandleRegistry
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache, unwrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import FutureMap
@@ -281,6 +294,267 @@ class Scheduler(
     SchedulerDllmMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
+
+    def _make_layer_stub(self, layer_id: int):
+        return type("LayerStub", (), {"layer_id": layer_id})()
+
+    def _graft_layer_ids(self) -> List[int]:
+        attention_layers = getattr(self.tp_worker.model_runner, "attention_layers", [])
+        return [layer.layer_id for layer in attention_layers if layer is not None]
+
+    def _should_export_after_prefill(
+        self, export_spec: Optional[KVExportSpec], prompt_len: int
+    ) -> bool:
+        if export_spec is None:
+            return False
+        token_end = export_spec.token_end
+        return token_end is not None and token_end <= prompt_len
+
+    def _resolve_graft_segment(
+        self, req: Req, segment, current_prefix_indices: List[int], current_prefix_tokens: List[int]
+    ) -> tuple[torch.Tensor, List[int], bool]:
+        entry = self.kv_handle_registry.lookup(segment.handle, tree_cache=self.tree_cache)
+        if entry.meta.model_key != self.kv_handle_registry.model_key:
+            raise ValueError(f"KV handle {segment.handle} belongs to another model")
+        if entry.meta.backend != self.kv_handle_registry.backend:
+            raise ValueError(f"KV handle {segment.handle} backend mismatch")
+
+        token_start = segment.token_start or 0
+        token_end = segment.token_end if segment.token_end is not None else len(entry.token_ids)
+        if token_start < 0 or token_end > len(entry.token_ids) or token_start >= token_end:
+            raise ValueError(f"Invalid graft slice for handle {segment.handle}")
+
+        slice_indices = entry.device_indices[token_start:token_end]
+        slice_token_ids = entry.token_ids[token_start:token_end]
+        transform = segment.transform
+        if transform is None or (
+            transform.rope_shift in (None, "off")
+            and transform.rescale_profile is None
+        ):
+            self.token_to_kv_pool_allocator.hold(slice_indices)
+            return slice_indices, list(slice_token_ids), False
+
+        ref_params = (
+            transform.rescale_params
+            if getattr(transform, "rescale_params", None) is not None
+            else {}
+        )
+        alias_bypass = bool(ref_params.get("alias_bypass")) if isinstance(ref_params, dict) else False
+        copy_only = bool(ref_params.get("copy_only")) if isinstance(ref_params, dict) else False
+        reference_handle = ref_params.get("reference_handle") if isinstance(ref_params, dict) else None
+        logger.info(
+            "[kv_graft flags] handle=%s copy_only=%s alias_bypass=%s rope=%s rescale=%s",
+            segment.handle,
+            copy_only,
+            alias_bypass,
+            getattr(transform, "rope_shift", None),
+            getattr(transform, "rescale_profile", None),
+        )
+        if alias_bypass:
+            logger.info(
+                "[kv_graft alias_bypass] handle=%s token_range=[%s,%s) origin_start=%s current_prefix_len=%s",
+                segment.handle,
+                token_start,
+                token_end,
+                segment.origin_start,
+                len(current_prefix_tokens),
+            )
+            self.token_to_kv_pool_allocator.hold(slice_indices)
+            return slice_indices, list(slice_token_ids), False
+
+        new_indices = self.token_to_kv_pool_allocator.alloc(slice_indices.numel())
+        if new_indices is None:
+            raise RuntimeError("Failed to allocate KV pages for graft transform")
+
+        if reference_handle:
+            ref_entry = self.kv_handle_registry.lookup(reference_handle, tree_cache=self.tree_cache)
+            ref_token_start = int(ref_params.get("reference_token_start", 0) or 0)
+            ref_token_end = ref_params.get("reference_token_end")
+            ref_token_end = (
+                int(ref_token_end)
+                if ref_token_end is not None
+                else len(ref_entry.token_ids)
+            )
+            if (
+                ref_token_start < 0
+                or ref_token_end > len(ref_entry.token_ids)
+                or ref_token_start >= ref_token_end
+            ):
+                raise ValueError(
+                    f"Invalid rescale reference slice for handle {reference_handle}"
+                )
+            ref_indices = ref_entry.device_indices[ref_token_start:ref_token_end]
+        else:
+            ref_indices = (
+                torch.tensor(current_prefix_indices, dtype=torch.int64, device=slice_indices.device)
+                if current_prefix_indices
+                else None
+            )
+        entry_origin_start = int(
+            getattr(entry.meta, "origin_start", segment.origin_start)
+        )
+        segment_origin_start = int(segment.origin_start)
+        # `segment.origin_start` may already describe the sliced segment's
+        # absolute source position (server-native answer-only handles do this),
+        # while some callers still pass the base handle's origin together with a
+        # non-zero token_start. Use the larger absolute start so we support both
+        # forms without double-counting sliced handles.
+        source_origin_start = max(
+            segment_origin_start, entry_origin_start + int(token_start)
+        )
+        logger.info(
+            "[kv_graft transform] handle=%s token_range=[%s,%s) entry_origin_start=%s segment_origin_start=%s source_origin_start=%s current_prefix_len=%s ref_len=%s rope=%s rescale=%s",
+            segment.handle,
+            token_start,
+            token_end,
+            entry_origin_start,
+            segment_origin_start,
+            source_origin_start,
+            len(current_prefix_tokens),
+            int(ref_indices.numel()) if ref_indices is not None else 0,
+            getattr(transform, "rope_shift", None),
+            getattr(transform, "rescale_profile", None),
+        )
+        self.kv_graft_materializer.transform_segment(
+            source_indices=slice_indices,
+            dst_indices=new_indices,
+            transform=transform,
+            origin_start=source_origin_start,
+            current_prefix_len_before_append=len(current_prefix_tokens),
+            layer_ids=self._graft_layer_ids(),
+            reference_indices=ref_indices,
+        )
+        return new_indices, list(slice_token_ids), True
+
+    def _apply_kv_graft(self, req: Req, recv_req: TokenizedGenerateReqInput):
+        req.kv_export_spec = recv_req.kv_export
+        input_len = len(recv_req.input_ids) if recv_req.input_ids is not None else 0
+        if recv_req.kv_graft is None:
+            req.graft_export_after_prefill = self._should_export_after_prefill(
+                recv_req.kv_export, input_len
+            )
+            req.disable_radix_match = req.graft_export_after_prefill
+            return
+        synthetic_tokens: List[int] = []
+        synthetic_indices: List[torch.Tensor] = []
+        owned_indices: List[torch.Tensor] = []
+        aliased_indices: List[torch.Tensor] = []
+        synthetic_owned_masks: List[torch.Tensor] = []
+        for segment in recv_req.kv_graft.segments:
+            seg_indices, seg_tokens, is_owned = self._resolve_graft_segment(
+                req, segment, [x for t in synthetic_indices for x in t.tolist()], synthetic_tokens
+            )
+            synthetic_tokens.extend(seg_tokens)
+            synthetic_indices.append(seg_indices)
+            synthetic_owned_masks.append(
+                torch.full(
+                    (seg_indices.numel(),),
+                    is_owned,
+                    dtype=torch.bool,
+                    device=seg_indices.device,
+                )
+            )
+            if is_owned:
+                owned_indices.append(seg_indices)
+            else:
+                aliased_indices.append(seg_indices)
+
+        req.kv_graft_spec = recv_req.kv_graft
+        req.synthetic_prefix_token_ids = synthetic_tokens
+        req.synthetic_prefix_indices = (
+            torch.cat(synthetic_indices) if synthetic_indices else torch.empty((0,), dtype=torch.int64)
+        )
+        req.synthetic_prefix_physical_len = len(req.synthetic_prefix_indices)
+        req.graft_export_after_prefill = self._should_export_after_prefill(
+            recv_req.kv_export, req.prompt_token_count
+        )
+        req.disable_radix_match = True
+        req.graft_backend = self.kv_handle_registry.backend
+        req.graft_owned_indices = (
+            torch.cat(owned_indices) if owned_indices else torch.empty((0,), dtype=torch.int64)
+        )
+        req.graft_aliased_indices = (
+            torch.cat(aliased_indices) if aliased_indices else torch.empty((0,), dtype=torch.int64)
+        )
+        req.graft_prefix_owned_mask = (
+            torch.cat(synthetic_owned_masks)
+            if synthetic_owned_masks
+            else torch.empty((0,), dtype=torch.bool)
+        )
+        logger.info(
+            "[kv_graft apply] rid=%s logical_prefix_len=%s physical_prefix_len=%s owned_len=%s aliased_len=%s owned_segments=%s",
+            req.rid,
+            len(req.synthetic_prefix_token_ids),
+            len(req.synthetic_prefix_indices),
+            int(req.graft_owned_indices.numel()),
+            int(req.graft_aliased_indices.numel()),
+            int(req.graft_prefix_owned_mask.sum().item()) if req.graft_prefix_owned_mask.numel() > 0 else 0,
+        )
+
+    def _maybe_register_kv_export(
+        self, req: Req, *, committed_len_override: Optional[int] = None
+    ):
+        if req.kv_export_spec is None or req.kv_exports:
+            return
+        spec = req.kv_export_spec
+        committed_len = (
+            int(committed_len_override)
+            if committed_len_override is not None
+            else int(req.kv_committed_len)
+        )
+        # Clamp to the logical sequence we can actually reconstruct locally.
+        # During decode, kv_committed_len can transiently run ahead of output_ids.
+        logical_token_ids = req.get_exportable_logical_token_ids(
+            committed_len=committed_len
+        )
+        if not logical_token_ids or req.req_pool_idx is None:
+            return
+        token_start = spec.token_start or 0
+        token_end = (
+            spec.token_end
+            if spec.token_end is not None
+            else committed_len
+        )
+        token_end = min(token_end, committed_len, len(logical_token_ids))
+        if token_start < 0 or token_start >= token_end:
+            return
+        token_ids = logical_token_ids[token_start:token_end]
+        device_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, token_start:token_end
+        ].to(torch.int64)
+        if device_indices.numel() == 0:
+            return
+        composite = bool(
+            req.synthetic_prefix_physical_len
+            and token_start < req.synthetic_prefix_physical_len
+        )
+        meta = self.kv_handle_registry.register(
+            allocator=self.token_to_kv_pool_allocator,
+            device_indices=device_indices,
+            token_ids=token_ids,
+            origin_start=spec.origin_start,
+            dtype=str(self.tp_worker.model_runner.kv_cache_dtype),
+            created_from_rid=req.rid,
+            ttl_seconds=spec.ttl_seconds,
+            persist=spec.persist,
+            name=spec.name,
+            composite=composite,
+            transform=(
+                req.kv_graft_spec.segments[-1].transform
+                if req.kv_graft_spec and req.kv_graft_spec.segments
+                else None
+            ),
+        )
+        req.kv_exports = [meta]
+
+    def _maybe_register_prefill_graft_export(self, req: Req):
+        if not req.graft_export_after_prefill:
+            return
+        # Graft prefill export should capture the fully materialized prompt prefix
+        # only, before any sampled decode token is folded into the request state.
+        self._maybe_register_kv_export(
+            req, committed_len_override=req.prompt_token_count
+        )
 
     def __init__(
         self,
@@ -715,6 +989,20 @@ class Scheduler(
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             self.tp_worker.get_memory_pool()
         )
+        kv_backend = "mla" if self.tp_worker.model_runner.use_mla_backend else "mha"
+        self.kv_handle_registry = KVHandleRegistry(
+            model_key=str(
+                self.server_args.served_model_name or self.server_args.model_path
+            ),
+            backend=kv_backend,
+        )
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        rope_theta = resolve_rope_theta_from_hf_config(self.model_config.hf_config)
+        self.kv_graft_materializer = (
+            MLAGraftMaterializer(kv_pool, rope_theta=rope_theta)
+            if kv_backend == "mla"
+            else MHAGraftMaterializer(kv_pool, rope_theta=rope_theta)
+        )
 
         # Create cache
         params = CacheInitParams(
@@ -1124,7 +1412,7 @@ class Scheduler(
             for req in batch.reqs:
                 start = len(req.prefix_indices)
                 end = start + req.extend_input_len
-                fill_ids = req.origin_input_ids + req.output_ids
+                fill_ids = req.logical_fill_ids
                 if start == 0:
                     tokens = fill_ids[start:end]
                     column_starts.append(0)
@@ -1182,6 +1470,9 @@ class Scheduler(
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
                 (PinPrefixReqInput, self.pin_prefix_wrapped),
+                (ReleaseKVHandlesReqInput, self.release_kv_handles),
+                (GetKVHandleReqInput, self.get_kv_handle),
+                (GetKVHandleTensorsReqInput, self.get_kv_handle_tensors),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
@@ -1551,6 +1842,8 @@ class Scheduler(
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
+        if hasattr(self, "kv_handle_registry"):
+            self.kv_handle_registry.cleanup_expired(tree_cache=self.tree_cache)
         for recv_req in recv_reqs:
             # Skip health check when server is busy — ongoing requests already carry health info.
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
@@ -1578,7 +1871,7 @@ class Scheduler(
                 if req.sampling_params.max_new_tokens is not None
                 else 1 << 30
             ),
-            self.max_req_len - len(req.origin_input_ids) - 1,
+            self.max_req_len - req.prompt_token_count - 1,
         )
 
     def _process_and_broadcast_mm_inputs(
@@ -1737,6 +2030,7 @@ class Scheduler(
                 time_stats=recv_req.time_stats,
             )
             req.tokenizer = self.tokenizer
+            self._apply_kv_graft(req, recv_req)
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -1837,19 +2131,22 @@ class Scheduler(
             if recv_req.return_logprob and recv_req.token_ids_logprob is None:
                 # If logprob is required but neither token_ids_logprob nor logprob_start_len is
                 # set, return the logprobs for output tokens by default
-                req.logprob_start_len = len(req.origin_input_ids)
+                req.logprob_start_len = req.prompt_token_count
             elif req.is_prefill_only:
                 # For prefill-only requests with logprob_start_len == -1, set logprob_start_len
                 # beyond input sequence to skip input logprob computation entirely
-                req.logprob_start_len = len(req.origin_input_ids)
+                req.logprob_start_len = req.prompt_token_count
             else:
                 # If return_logprob is False, only the last token requires logprob computation
                 req.logprob_start_len = -1
         else:
             req.logprob_start_len = recv_req.logprob_start_len
 
-        if req.logprob_start_len > len(req.origin_input_ids):
-            error_msg = f"{req.logprob_start_len=} is higher than the number of input tokens {len(req.origin_input_ids)=}. Please use a smaller logprob_start_len."
+        if req.logprob_start_len > req.prompt_token_count:
+            error_msg = (
+                f"{req.logprob_start_len=} is higher than the number of input tokens "
+                f"{req.prompt_token_count=}. Please use a smaller logprob_start_len."
+            )
             req.logprob_start_len = -1
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
@@ -1976,6 +2273,12 @@ class Scheduler(
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
 
+        if (
+            getattr(req_to_abort, "disable_radix_match", False)
+            or req_to_abort.mamba_pool_idx is not None
+        ):
+            release_kv_cache(req_to_abort, self.tree_cache, is_insert=False)
+
         self.send_to_tokenizer.send_output(
             AbortReq(
                 finished_reason={
@@ -2002,6 +2305,11 @@ class Scheduler(
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)
+                if (
+                    getattr(req, "disable_radix_match", False)
+                    or req.mamba_pool_idx is not None
+                ):
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
                 self.send_to_tokenizer.send_output(
                     AbortReq(
                         finished_reason={
@@ -2111,7 +2419,7 @@ class Scheduler(
         batch.req_pool_indices = torch.tensor(
             [r.req_pool_idx for r in reqs], dtype=torch.int64, device=device
         )
-        seq_lens = [len(r.origin_input_ids) + len(r.output_ids) - 1 for r in reqs]
+        seq_lens = [r.prompt_token_count + len(r.output_ids) - 1 for r in reqs]
         batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
         batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         batch.orig_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
@@ -3028,6 +3336,8 @@ class Scheduler(
         if self.is_fully_idle():
             self.cur_batch = None
             self.last_batch = None
+            if hasattr(self, "kv_handle_registry"):
+                self.kv_handle_registry.clear(tree_cache=self.tree_cache)
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
@@ -3073,8 +3383,80 @@ class Scheduler(
 
         # This field is not serializable.
         ret.pop("model_config", None)
+        if hasattr(self, "kv_handle_registry"):
+            ret["kv_handle_count"] = len(self.kv_handle_registry._entries)
 
         return GetInternalStateReqOutput(internal_state=ret)
+
+    def release_kv_handles(
+        self, recv_req: ReleaseKVHandlesReqInput
+    ) -> ReleaseKVHandlesReqOutput:
+        released, missing = self.kv_handle_registry.release(
+            recv_req.handles, tree_cache=self.tree_cache
+        )
+        return ReleaseKVHandlesReqOutput(
+            success=len(missing) == 0,
+            released_handles=released,
+            missing_handles=missing,
+            message="" if not missing else f"Missing handles: {missing}",
+        )
+
+    def get_kv_handle(self, recv_req: GetKVHandleReqInput) -> GetKVHandleReqOutput:
+        meta = self.kv_handle_registry.get_meta(recv_req.handle)
+        if meta is None:
+            return GetKVHandleReqOutput(
+                success=False, handle_meta=None, message="KV handle not found"
+            )
+        return GetKVHandleReqOutput(success=True, handle_meta=meta)
+
+    def get_kv_handle_tensors(
+        self, recv_req: GetKVHandleTensorsReqInput
+    ) -> GetKVHandleTensorsReqOutput:
+        try:
+            entry = self.kv_handle_registry.lookup(recv_req.handle, tree_cache=self.tree_cache)
+        except KeyError:
+            return GetKVHandleTensorsReqOutput(
+                success=False,
+                handle_meta=None,
+                message="KV handle not found",
+            )
+
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        layer_ids = recv_req.layer_ids or self._graft_layer_ids()
+        include_values = bool(recv_req.include_values)
+        indices = entry.device_indices.to(torch.int64)
+        layers = []
+        is_mla_backend = self.kv_handle_registry.backend == "mla"
+
+        for layer_id in layer_ids:
+            if is_mla_backend:
+                layer_stub = self._make_layer_stub(layer_id)
+                k_nope, k_rope = kv_pool.get_mla_kv_buffer(layer_stub, indices)
+                layer_item = {
+                    "layer_id": int(layer_id),
+                    "k_nope": k_nope.detach().float().cpu().tolist(),
+                    "k_rope": k_rope.detach().float().cpu().tolist(),
+                }
+                layers.append(layer_item)
+                continue
+
+            k = kv_pool.get_key_buffer(layer_id)[indices]
+            layer_item = {
+                "layer_id": int(layer_id),
+                "k": k.detach().float().cpu().tolist(),
+            }
+            if include_values:
+                v = kv_pool.get_value_buffer(layer_id)[indices]
+                layer_item["v"] = v.detach().float().cpu().tolist()
+            layers.append(layer_item)
+
+        return GetKVHandleTensorsReqOutput(
+            success=True,
+            handle_meta=entry.meta,
+            device_indices=indices.detach().cpu().tolist(),
+            token_ids=list(entry.token_ids),
+            layers=layers,
+        )
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args
@@ -3170,6 +3552,11 @@ class Scheduler(
             # For mamba radix cache
             if (
                 req.mamba_pool_idx is not None
+                and self.disaggregation_mode != DisaggregationMode.DECODE
+            ):
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+            elif (
+                getattr(req, "disable_radix_match", False)
                 and self.disaggregation_mode != DisaggregationMode.DECODE
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)

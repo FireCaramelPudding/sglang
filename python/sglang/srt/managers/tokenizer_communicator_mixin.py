@@ -43,6 +43,10 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    GetKVHandleReqInput,
+    GetKVHandleReqOutput,
+    GetKVHandleTensorsReqInput,
+    GetKVHandleTensorsReqOutput,
     GetLoadReqInput,
     GetLoadReqOutput,
     GetLoadsReqInput,
@@ -64,6 +68,8 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
+    ReleaseKVHandlesReqInput,
+    ReleaseKVHandlesReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -219,6 +225,15 @@ class TokenizerCommunicatorMixin:
         self.pin_prefix_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.release_kv_handles_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.get_kv_handle_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.get_kv_handle_tensors_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.profile_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -312,6 +327,18 @@ class TokenizerCommunicatorMixin:
                 (
                     PinPrefixReqOutput,
                     self.pin_prefix_communicator.handle_recv,
+                ),
+                (
+                    ReleaseKVHandlesReqOutput,
+                    self.release_kv_handles_communicator.handle_recv,
+                ),
+                (
+                    GetKVHandleReqOutput,
+                    self.get_kv_handle_communicator.handle_recv,
+                ),
+                (
+                    GetKVHandleTensorsReqOutput,
+                    self.get_kv_handle_tensors_communicator.handle_recv,
                 ),
                 (
                     FlushCacheReqOutput,
@@ -433,6 +460,53 @@ class TokenizerCommunicatorMixin:
         return PinPrefixReqOutput(
             success=all_success, nodes_pinned=total, message=all_message
         )
+
+    async def release_kv_handles(
+        self: TokenizerManager, handles: List[str]
+    ) -> ReleaseKVHandlesReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.release_kv_handles_communicator(
+            ReleaseKVHandlesReqInput(handles=handles)
+        )
+        all_success = all(r.success for r in results)
+        released_handles = [h for r in results for h in r.released_handles]
+        missing_handles = [h for r in results for h in r.missing_handles]
+        message = " | ".join([r.message for r in results if r.message])
+        return ReleaseKVHandlesReqOutput(
+            success=all_success,
+            released_handles=released_handles,
+            missing_handles=missing_handles,
+            message=message,
+        )
+
+    async def get_kv_handle(
+        self: TokenizerManager, handle: str
+    ) -> GetKVHandleReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.get_kv_handle_communicator(GetKVHandleReqInput(handle=handle))
+        for result in results:
+            if result.success:
+                return result
+        return results[0]
+
+    async def get_kv_handle_tensors(
+        self: TokenizerManager,
+        handle: str,
+        layer_ids: Optional[List[int]] = None,
+        include_values: bool = True,
+    ) -> GetKVHandleTensorsReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.get_kv_handle_tensors_communicator(
+            GetKVHandleTensorsReqInput(
+                handle=handle,
+                layer_ids=layer_ids,
+                include_values=include_values,
+            )
+        )
+        for result in results:
+            if result.success:
+                return result
+        return results[0]
 
     async def start_profile(
         self: TokenizerManager,

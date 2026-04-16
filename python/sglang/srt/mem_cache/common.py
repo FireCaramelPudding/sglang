@@ -463,17 +463,62 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+    if getattr(req, "disable_radix_match", False):
+        # Synthetic prefix ownership is independent from kv_committed_len.
+        # A request can be aborted before any KV commit, while graft alias/owned
+        # pages were already held/allocated during request construction.
+        if req.graft_owned_indices.numel() > 0:
+            tree_cache.token_to_kv_pool_allocator.free(req.graft_owned_indices)
+            req.graft_owned_indices = torch.empty((0,), dtype=torch.int64)
+        if req.graft_aliased_indices.numel() > 0:
+            tree_cache.token_to_kv_pool_allocator.release_hold(req.graft_aliased_indices)
+            req.graft_aliased_indices = torch.empty((0,), dtype=torch.int64)
+
+        # Nothing was bound to req_to_token_pool yet (e.g. dropped in waiting queue).
+        if req.req_pool_idx is None:
+            return
+
+        kv_committed_len = req.pop_committed_kv_cache()
+        kv_indices = tree_cache.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :kv_committed_len
+        ]
+        synthetic_prefix_len = req.synthetic_prefix_physical_len
+
+        # Live pages are only the committed suffix after synthetic prefix.
+        live_start = min(synthetic_prefix_len, kv_committed_len)
+        if live_start < kv_committed_len:
+            tree_cache.token_to_kv_pool_allocator.free(kv_indices[live_start:])
+
+        # Owned transformed graft pages live in the request allocation. They are either
+        # exported via registry-held references or freed by the allocator free above.
+        start_p, end_p = req.pop_overallocated_kv_cache()
+        global_server_args = get_global_server_args()
+        page_size = global_server_args.page_size
+        if page_size > 1:
+            start_p = ceil_align(start_p, page_size)
+        if start_p < end_p:
+            indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
+                start_p:end_p
+            ]
+            tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
+
+        if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
+            not tree_cache.supports_mamba()
+        ):
+            if req.mamba_pool_idx is not None:
+                tree_cache.req_to_token_pool.free_mamba_cache(req)
+        tree_cache.req_to_token_pool.free(req)
+        return
+
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
-        assert (
-            tree_cache.supports_mamba()
-        ), "Only MambaRadixCache allow freeing before alloc"
-        # TODO (csy, hanming): clean up this early allocation logic
-        if req.mamba_pool_idx is not None:
-            tree_cache.req_to_token_pool.mamba_pool.free(
-                req.mamba_pool_idx.unsqueeze(-1)
-            )
-            req.mamba_pool_idx = None
+        if tree_cache.supports_mamba():
+            # TODO (csy, hanming): clean up this early allocation logic
+            if req.mamba_pool_idx is not None:
+                tree_cache.req_to_token_pool.mamba_pool.free(
+                    req.mamba_pool_idx.unsqueeze(-1)
+                )
+                req.mamba_pool_idx = None
         return
 
     tree_cache.cache_finished_req(req, is_insert=is_insert)

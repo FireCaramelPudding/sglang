@@ -127,6 +127,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
+            kv_graft=self._get_sgl_kv_fields(request)[0],
+            kv_export=self._get_sgl_kv_fields(request)[1],
         )
 
         return adapted_request, request
@@ -207,6 +209,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         cached_tokens = {}
         hidden_states = {}
         routed_experts = {}
+        kv_exports = {}
 
         try:
             async for content in self.tokenizer_manager.generate_request(
@@ -222,6 +225,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
+                kv_exports[index] = content["meta_info"].get("kv_exports", None)
 
                 stream_buffer = stream_buffers.get(index, "")
                 # Handle echo for first chunk
@@ -353,6 +357,18 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     )
                     yield f"data: {routed_experts_chunk.model_dump_json()}\n\n"
 
+            first_kv_exports = next((v for v in kv_exports.values() if v is not None), None)
+            if first_kv_exports is not None:
+                kv_exports_chunk = CompletionStreamResponse(
+                    id=content["meta_info"]["id"],
+                    created=created,
+                    object="text_completion",
+                    choices=[],
+                    model=request.model,
+                    sglext=SglExt(sgl_kv_exports=first_kv_exports),
+                )
+                yield f"data: {kv_exports_chunk.model_dump_json()}\n\n"
+
             # Handle final usage chunk
             if request.stream_options and request.stream_options.include_usage:
                 usage = UsageProcessor.calculate_streaming_usage(
@@ -426,11 +442,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )
+        kv_exports = self._extract_kv_exports_from_ret(first_ret)
         response_sglext = None
-        if routed_experts or cached_tokens_details:
+        if routed_experts or cached_tokens_details or kv_exports:
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
+                sgl_kv_exports=kv_exports,
             )
 
         for idx, ret_item in enumerate(ret):
