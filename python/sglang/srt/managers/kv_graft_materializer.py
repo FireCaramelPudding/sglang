@@ -65,6 +65,30 @@ class BaseKVGraftMaterializer:
         return norms.mean(dim=reduce_dims, keepdim=True)
 
     @staticmethod
+    def _amplify_k_tensor(
+        k: torch.Tensor, amplify_token_count: int, amplify_ratio: float
+    ) -> torch.Tensor:
+        if amplify_ratio == 1.0 or amplify_token_count <= 0:
+            return k
+        actual = min(amplify_token_count, int(k.shape[0]))
+        k_out = k.clone()
+        k_out[:actual] = k_out[:actual] * amplify_ratio
+        return k_out
+
+    @staticmethod
+    def _compute_k_amplify_ratio(
+        k: torch.Tensor, sys_token_count: int, eps: float = 1e-6
+    ) -> float:
+        if sys_token_count <= 0 or sys_token_count > int(k.shape[0]):
+            return 1.0
+        sys_k = k[:sys_token_count].float()
+        overall_k = k.float()
+        sys_norm = torch.norm(sys_k, p=2, dim=-1).mean()
+        overall_norm = torch.norm(overall_k, p=2, dim=-1).mean()
+        ratio = overall_norm / (sys_norm + eps)
+        return max(1.0, min(float(ratio.item()), 5.0))
+
+    @staticmethod
     def _rescale_tensor(
         src: torch.Tensor, tgt: torch.Tensor, eps: float = 1e-6
     ) -> torch.Tensor:
@@ -169,8 +193,17 @@ class MHAGraftMaterializer(BaseKVGraftMaterializer):
         delta = current_prefix_len_before_append - origin_start
         copy_only = bool(getattr(transform, "rescale_params", None) and transform.rescale_params.get("copy_only"))
         alias_bypass = bool(getattr(transform, "rescale_params", None) and transform.rescale_params.get("alias_bypass"))
+        _rescale_params = getattr(transform, "rescale_params", None) or {}
+        k_amplify_token_count = int(_rescale_params.get("k_amplify_token_count", 0) or 0)
+        k_amplify_ratio = float(_rescale_params.get("k_amplify_ratio", 0) or 0)
+        k_amplify_mode = str(_rescale_params.get("k_amplify_mode", "fixed") or "fixed")
+        k_amplify_enabled = (
+            not copy_only
+            and k_amplify_token_count > 0
+            and (k_amplify_ratio > 0 or k_amplify_mode == "auto")
+        )
         logger.info(
-            "[kv_graft materialize MHA] src_len=%s dst_len=%s ref_len=%s origin_start=%s current_prefix_len=%s delta=%s rope=%s rescale=%s copy_only=%s alias_bypass=%s",
+            "[kv_graft materialize MHA] src_len=%s dst_len=%s ref_len=%s origin_start=%s current_prefix_len=%s delta=%s rope=%s rescale=%s copy_only=%s alias_bypass=%s k_amplify=%s k_amplify_ratio=%s k_amplify_mode=%s k_amplify_tokens=%s",
             int(source_indices.numel()),
             int(dst_indices.numel()),
             int(reference_indices.numel()) if reference_indices is not None else 0,
@@ -181,6 +214,10 @@ class MHAGraftMaterializer(BaseKVGraftMaterializer):
             getattr(transform, "rescale_profile", None),
             copy_only,
             alias_bypass,
+            k_amplify_enabled,
+            k_amplify_ratio,
+            k_amplify_mode,
+            k_amplify_token_count,
         )
         sample_src = source_indices[: min(8, int(source_indices.numel()))].tolist()
         sample_dst = dst_indices[: min(8, int(dst_indices.numel()))].tolist()
@@ -211,6 +248,17 @@ class MHAGraftMaterializer(BaseKVGraftMaterializer):
             # frame first, then K is rotated into the target position.
             if not copy_only and transform.rope_shift in ("on", "auto") and delta != 0:
                 k = self._rope_shift_tensor(k, delta, origin_start=origin_start)
+            if k_amplify_enabled:
+                actual_count = min(k_amplify_token_count, int(k.shape[0]))
+                if actual_count > 0:
+                    if k_amplify_mode == "auto":
+                        k_amplify_ratio = self._compute_k_amplify_ratio(k, actual_count)
+                    k[:actual_count] = k[:actual_count] * k_amplify_ratio
+                    if layer_id == layer_ids[0]:
+                        logger.info(
+                            "[kv_graft k_amplify MHA] mode=%s ratio=%.4f sys_tokens=%s/%s",
+                            k_amplify_mode, k_amplify_ratio, actual_count, k_amplify_token_count,
+                        )
             self.kv_pool.get_key_buffer(layer_id)[dst_indices] = k
             self.kv_pool.get_value_buffer(layer_id)[dst_indices] = v
             if copy_only and layer_id == layer_ids[0]:
@@ -241,8 +289,17 @@ class MLAGraftMaterializer(BaseKVGraftMaterializer):
         delta = current_prefix_len_before_append - origin_start
         copy_only = bool(getattr(transform, "rescale_params", None) and transform.rescale_params.get("copy_only"))
         alias_bypass = bool(getattr(transform, "rescale_params", None) and transform.rescale_params.get("alias_bypass"))
+        _rescale_params = getattr(transform, "rescale_params", None) or {}
+        k_amplify_token_count = int(_rescale_params.get("k_amplify_token_count", 0) or 0)
+        k_amplify_ratio = float(_rescale_params.get("k_amplify_ratio", 0) or 0)
+        k_amplify_mode = str(_rescale_params.get("k_amplify_mode", "fixed") or "fixed")
+        k_amplify_enabled = (
+            not copy_only
+            and k_amplify_token_count > 0
+            and (k_amplify_ratio > 0 or k_amplify_mode == "auto")
+        )
         logger.info(
-            "[kv_graft materialize MLA] src_len=%s dst_len=%s ref_len=%s origin_start=%s current_prefix_len=%s delta=%s rope=%s rescale=%s copy_only=%s alias_bypass=%s",
+            "[kv_graft materialize MLA] src_len=%s dst_len=%s ref_len=%s origin_start=%s current_prefix_len=%s delta=%s rope=%s rescale=%s copy_only=%s alias_bypass=%s k_amplify=%s k_amplify_ratio=%s k_amplify_mode=%s k_amplify_tokens=%s",
             int(source_indices.numel()),
             int(dst_indices.numel()),
             int(reference_indices.numel()) if reference_indices is not None else 0,
@@ -253,6 +310,10 @@ class MLAGraftMaterializer(BaseKVGraftMaterializer):
             getattr(transform, "rescale_profile", None),
             copy_only,
             alias_bypass,
+            k_amplify_enabled,
+            k_amplify_ratio,
+            k_amplify_mode,
+            k_amplify_token_count,
         )
         sample_src = source_indices[: min(8, int(source_indices.numel()))].tolist()
         sample_dst = dst_indices[: min(8, int(dst_indices.numel()))].tolist()
@@ -282,6 +343,18 @@ class MLAGraftMaterializer(BaseKVGraftMaterializer):
                 k_rope = self._rescale_tensor(k_rope, dst_k_rope)
             if not copy_only and transform.rope_shift in ("on", "auto") and delta != 0:
                 k_rope = self._rope_shift_tensor(k_rope, delta, origin_start=origin_start)
+            if k_amplify_enabled:
+                actual_count = min(k_amplify_token_count, int(k_nope.shape[0]))
+                if actual_count > 0:
+                    if k_amplify_mode == "auto":
+                        k_amplify_ratio = self._compute_k_amplify_ratio(k_nope, actual_count)
+                    k_nope[:actual_count] = k_nope[:actual_count] * k_amplify_ratio
+                    k_rope[:actual_count] = k_rope[:actual_count] * k_amplify_ratio
+                    if layer_id == layer_ids[0]:
+                        logger.info(
+                            "[kv_graft k_amplify MLA] mode=%s ratio=%.4f sys_tokens=%s/%s",
+                            k_amplify_mode, k_amplify_ratio, actual_count, k_amplify_token_count,
+                        )
             self.kv_pool.set_mla_kv_buffer(layer_stub, dst_indices, k_nope, k_rope)
             if copy_only and layer_id == layer_ids[0]:
                 copied_k_nope, copied_k_rope = self.kv_pool.get_mla_kv_buffer(layer_stub, dst_indices, dst_dtype=k_nope.dtype)

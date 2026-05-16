@@ -327,28 +327,37 @@ class Scheduler(
         slice_indices = entry.device_indices[token_start:token_end]
         slice_token_ids = entry.token_ids[token_start:token_end]
         transform = segment.transform
+        ref_params = (
+            transform.rescale_params
+            if transform is not None and getattr(transform, "rescale_params", None) is not None
+            else {}
+        )
+        _k_amplify_token_count = int(ref_params.get("k_amplify_token_count", 0) or 0)
+        _k_amplify_ratio = float(ref_params.get("k_amplify_ratio", 0) or 0)
+        _k_amplify_mode = str(ref_params.get("k_amplify_mode", "fixed") or "fixed")
+        _has_k_amplify = bool(
+            _k_amplify_token_count > 0
+            and (_k_amplify_ratio > 0 or _k_amplify_mode == "auto")
+        )
         if transform is None or (
             transform.rope_shift in (None, "off")
             and transform.rescale_profile is None
+            and not _has_k_amplify
         ):
             self.token_to_kv_pool_allocator.hold(slice_indices)
             return slice_indices, list(slice_token_ids), False
 
-        ref_params = (
-            transform.rescale_params
-            if getattr(transform, "rescale_params", None) is not None
-            else {}
-        )
         alias_bypass = bool(ref_params.get("alias_bypass")) if isinstance(ref_params, dict) else False
         copy_only = bool(ref_params.get("copy_only")) if isinstance(ref_params, dict) else False
         reference_handle = ref_params.get("reference_handle") if isinstance(ref_params, dict) else None
         logger.info(
-            "[kv_graft flags] handle=%s copy_only=%s alias_bypass=%s rope=%s rescale=%s",
+            "[kv_graft flags] handle=%s copy_only=%s alias_bypass=%s rope=%s rescale=%s k_amplify=%s",
             segment.handle,
             copy_only,
             alias_bypass,
             getattr(transform, "rope_shift", None),
             getattr(transform, "rescale_profile", None),
+            _has_k_amplify,
         )
         if alias_bypass:
             logger.info(
@@ -509,7 +518,10 @@ class Scheduler(
         )
         if not logical_token_ids or req.req_pool_idx is None:
             return
-        token_start = spec.token_start or 0
+        if spec.token_start is not None:
+            token_start = spec.token_start
+        else:
+            token_start = req.synthetic_prefix_physical_len
         token_end = (
             spec.token_end
             if spec.token_end is not None
@@ -528,11 +540,19 @@ class Scheduler(
             req.synthetic_prefix_physical_len
             and token_start < req.synthetic_prefix_physical_len
         )
+        # When origin_start is the default (0) infer from token_start so
+        # rope_shift uses correct source positions for grafted KV pages.
+        # token_start already accounts for synthetic_prefix_physical_len,
+        # which is where the non-synthetic tokens were RoPE-encoded.
+        if spec.origin_start > 0:
+            origin_start = spec.origin_start
+        else:
+            origin_start = token_start
         meta = self.kv_handle_registry.register(
             allocator=self.token_to_kv_pool_allocator,
             device_indices=device_indices,
             token_ids=token_ids,
-            origin_start=spec.origin_start,
+            origin_start=origin_start,
             dtype=str(self.tp_worker.model_runner.kv_cache_dtype),
             created_from_rid=req.rid,
             ttl_seconds=spec.ttl_seconds,
