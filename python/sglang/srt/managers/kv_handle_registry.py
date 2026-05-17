@@ -250,10 +250,12 @@ class KVHandleRegistry:
 
         return held_items
 
-    def _new_handle(self, name: Optional[str] = None) -> str:
+    def _new_handle(self, name: Optional[str] = None, created_from_rid: Optional[str] = None) -> str:
         prefix = "kvh"
         if name:
             return f"{prefix}_{name}_{uuid.uuid4().hex}"
+        if created_from_rid:
+            return f"{prefix}_{created_from_rid}"
         return f"{prefix}_{uuid.uuid4().hex}"
 
     def register(
@@ -272,7 +274,7 @@ class KVHandleRegistry:
         transform: Optional[KVTransformSpec] = None,
         transform_provenance: Optional[List[KVTransformSpec]] = None,
     ) -> KVHandleMeta:
-        handle = self._new_handle(name)
+        handle = self._new_handle(name, created_from_rid=created_from_rid)
         indices = device_indices.detach().clone().to(dtype=torch.int64)
         allocator.hold(indices)
         meta = KVHandleMeta(
