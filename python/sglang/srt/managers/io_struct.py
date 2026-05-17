@@ -155,6 +155,8 @@ class KVGraftSegment:
             and self.token_end < self.token_start
         ):
             raise ValueError("token_end must be >= token_start")
+        if isinstance(self.transform, dict):
+            self.transform = KVTransformSpec(**self.transform)
 
 
 @dataclass
@@ -164,6 +166,10 @@ class KVGraftSpec:
     def __post_init__(self):
         if not self.segments:
             raise ValueError("kv_graft.segments must not be empty")
+        self.segments = [
+            KVGraftSegment(**s) if isinstance(s, dict) else s
+            for s in self.segments
+        ]
 
 
 @dataclass
