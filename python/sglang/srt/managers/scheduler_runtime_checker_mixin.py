@@ -705,6 +705,14 @@ class SchedulerRuntimeCheckerMixin:
             if self.hisparse_coordinator.has_ongoing_staging():
                 return
 
+        # Release expired KV handles before memory check so their
+        # allocator holds are freed — stale handles (e.g. from a
+        # disconnected / stuck client) otherwise cause held+pending
+        # limbo items that trigger false-positive leak detection.
+        registry = getattr(self, "kv_handle_registry", None)
+        if registry is not None:
+            registry.cleanup_expired(tree_cache=self.tree_cache)
+
         self.check_memory()
         self.check_tree_cache()
         self.new_token_ratio = self.init_new_token_ratio

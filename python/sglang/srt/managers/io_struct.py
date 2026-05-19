@@ -180,6 +180,7 @@ class KVExportSpec:
     persist: bool = True
     ttl_seconds: int = 300
     name: Optional[str] = None
+    materialize_graft_prefix: bool = False
 
     def __post_init__(self):
         if self.token_start is not None and self.token_start < 0:
@@ -209,6 +210,8 @@ class KVHandleMeta:
     ttl_seconds: int = 300
     name: Optional[str] = None
     transform: Optional[KVTransformSpec] = None
+    materialized: bool = False
+    transform_provenance: Optional[List[KVTransformSpec]] = None
 
 
 @dataclass

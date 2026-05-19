@@ -135,6 +135,16 @@ class _LookupRegistry:
         return self.entry
 
 
+class _LookupRecordingRegistry(_LookupRegistry):
+    def __init__(self, entry):
+        super().__init__(entry)
+        self.register_calls = []
+
+    def register(self, **kwargs):
+        self.register_calls.append(kwargs)
+        return SimpleNamespace(handle="kvh_materialized", token_count=len(kwargs["token_ids"]))
+
+
 class _AllocRecorder:
     def __init__(self):
         self.held = []
@@ -196,6 +206,14 @@ class _ApplyGraftReq:
         self.kv_export_spec = None
         self.graft_export_after_prefill = False
         self.disable_radix_match = False
+
+
+class _ApplyMaterializeReq(_ApplyGraftReq):
+    def __init__(self):
+        super().__init__()
+        self.rid = "req_materialize"
+        self.prompt_token_count = 0
+        self.kv_exports = []
 
 
 class _MixedRunningReq:
@@ -474,6 +492,107 @@ class TestKVGraftRegressions(unittest.TestCase):
         self.assertEqual(req.kv_export_spec, recv_req.kv_export)
         self.assertFalse(req.graft_export_after_prefill)
         self.assertFalse(req.disable_radix_match)
+
+    def test_kv_export_spec_accepts_materialize_graft_prefix(self):
+        spec = KVExportSpec(materialize_graft_prefix=True)
+
+        self.assertTrue(spec.materialize_graft_prefix)
+
+    def test_apply_kv_graft_materializes_transformed_prefix_export(self):
+        entry = SimpleNamespace(
+            meta=SimpleNamespace(model_key="model", backend="mha", origin_start=0),
+            device_indices=torch.tensor([10, 11], dtype=torch.int64),
+            token_ids=[100, 101],
+        )
+        allocator = _AllocRecorder()
+        allocator.next_alloc = torch.tensor([20, 21], dtype=torch.int64)
+        materializer = _MaterializerRecorder()
+        registry = _LookupRecordingRegistry(entry)
+        fake_scheduler = SimpleNamespace(
+            kv_handle_registry=registry,
+            tree_cache=SimpleNamespace(evict=lambda need: []),
+            token_to_kv_pool_allocator=allocator,
+            kv_graft_materializer=materializer,
+            tp_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(kv_cache_dtype=torch.bfloat16)
+            ),
+            _graft_layer_ids=lambda: [0],
+            _should_export_after_prefill=lambda export_spec, prompt_len: (
+                Scheduler._should_export_after_prefill(
+                    fake_scheduler, export_spec, prompt_len
+                )
+            ),
+        )
+        fake_scheduler._resolve_graft_segment = lambda req, segment, current_prefix_indices, current_prefix_tokens: (
+            Scheduler._resolve_graft_segment(
+                fake_scheduler,
+                req,
+                segment,
+                current_prefix_indices,
+                current_prefix_tokens,
+            )
+        )
+        transform = SimpleNamespace(
+            rope_shift="on",
+            rescale_profile="match_stats",
+            rescale_params=None,
+        )
+        req = _ApplyMaterializeReq()
+        recv_req = SimpleNamespace(
+            kv_export=KVExportSpec(
+                token_start=0,
+                materialize_graft_prefix=True,
+                ttl_seconds=123,
+                name="mat",
+            ),
+            input_ids=[1, 2],
+            kv_graft=SimpleNamespace(
+                segments=[
+                    SimpleNamespace(
+                        handle="kvh_source",
+                        token_start=None,
+                        token_end=None,
+                        origin_start=0,
+                        transform=transform,
+                    )
+                ]
+            ),
+        )
+
+        Scheduler._apply_kv_graft(fake_scheduler, req, recv_req)
+
+        self.assertEqual(len(materializer.calls), 1)
+        self.assertEqual(len(registry.register_calls), 1)
+        call = registry.register_calls[0]
+        self.assertEqual(call["device_indices"].tolist(), [20, 21])
+        self.assertEqual(call["token_ids"], [100, 101])
+        self.assertEqual(call["origin_start"], 0)
+        self.assertTrue(call["composite"])
+        self.assertTrue(call["materialized"])
+        self.assertIsNone(call["transform"])
+        self.assertEqual(call["transform_provenance"], [transform])
+        self.assertEqual(req.kv_exports[0].handle, "kvh_materialized")
+
+        fake_scheduler.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.tensor([[20, 21, 30, 31]], dtype=torch.int64)
+        )
+        req.req_pool_idx = 0
+        req.kv_committed_len = 4
+        req.get_exportable_logical_token_ids = lambda committed_len=None: [
+            100, 101, 200, 201
+        ][:committed_len]
+
+        Scheduler._maybe_register_kv_export(fake_scheduler, req)
+
+        self.assertEqual(len(registry.register_calls), 2)
+        full_call = registry.register_calls[1]
+        self.assertEqual(full_call["device_indices"].tolist(), [20, 21, 30, 31])
+        self.assertEqual(full_call["token_ids"], [100, 101, 200, 201])
+        self.assertEqual(full_call["origin_start"], 0)
+        self.assertTrue(full_call["composite"])
+        self.assertTrue(full_call["materialized"])
+        self.assertEqual(full_call["transform_provenance"], [transform])
+        self.assertEqual(len(req.kv_exports), 2)
 
     def test_graft_transform_offsets_origin_start_by_token_start(self):
         entry = SimpleNamespace(

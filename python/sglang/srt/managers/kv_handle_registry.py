@@ -272,6 +272,7 @@ class KVHandleRegistry:
         name: Optional[str] = None,
         composite: bool = False,
         transform: Optional[KVTransformSpec] = None,
+        materialized: bool = False,
         transform_provenance: Optional[List[KVTransformSpec]] = None,
     ) -> KVHandleMeta:
         handle = self._new_handle(name, created_from_rid=created_from_rid)
@@ -289,6 +290,8 @@ class KVHandleRegistry:
             ttl_seconds=ttl_seconds,
             name=name,
             transform=transform,
+            materialized=materialized,
+            transform_provenance=transform_provenance,
         )
         entry = KVHandleEntry(
             meta=meta,

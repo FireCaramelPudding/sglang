@@ -373,7 +373,19 @@ class Scheduler(
 
         new_indices = self.token_to_kv_pool_allocator.alloc(slice_indices.numel())
         if new_indices is None:
-            raise RuntimeError("Failed to allocate KV pages for graft transform")
+            num_needed = slice_indices.numel()
+            evicted = self.tree_cache.evict(num_needed)
+            logger.warning(
+                "[kv_graft alloc] first attempt failed (need=%s), evicted %s tokens from radix cache, retrying",
+                num_needed,
+                len(evicted) if evicted else 0,
+            )
+            new_indices = self.token_to_kv_pool_allocator.alloc(num_needed)
+            if new_indices is None:
+                raise RuntimeError(
+                    f"Failed to allocate KV pages for graft transform "
+                    f"(need={num_needed}, evicted={len(evicted) if evicted else 0})"
+                )
 
         if reference_handle:
             ref_entry = self.kv_handle_registry.lookup(reference_handle, tree_cache=self.tree_cache)
@@ -499,13 +511,55 @@ class Scheduler(
             int(req.graft_aliased_indices.numel()),
             int(req.graft_prefix_owned_mask.sum().item()) if req.graft_prefix_owned_mask.numel() > 0 else 0,
         )
+        if (
+            recv_req.kv_export is not None
+            and recv_req.kv_export.materialize_graft_prefix
+            and req.synthetic_prefix_indices.numel() > 0
+            and any(segment.transform is not None for segment in recv_req.kv_graft.segments)
+        ):
+            spec = recv_req.kv_export
+            transform_provenance = [
+                segment.transform
+                for segment in recv_req.kv_graft.segments
+                if segment.transform is not None
+            ]
+            meta = self.kv_handle_registry.register(
+                allocator=self.token_to_kv_pool_allocator,
+                device_indices=req.synthetic_prefix_indices,
+                token_ids=req.synthetic_prefix_token_ids,
+                origin_start=0,
+                dtype=str(self.tp_worker.model_runner.kv_cache_dtype),
+                created_from_rid=req.rid,
+                ttl_seconds=spec.ttl_seconds,
+                persist=spec.persist,
+                name=spec.name,
+                composite=True,
+                transform=None,
+                materialized=True,
+                transform_provenance=transform_provenance,
+            )
+            req.kv_exports = [meta]
+            logger.info(
+                "[kv_graft materialize] rid=%s handle=%s token_count=%s transform_segments=%s",
+                req.rid,
+                meta.handle,
+                meta.token_count,
+                len(transform_provenance),
+            )
 
     def _maybe_register_kv_export(
         self, req: Req, *, committed_len_override: Optional[int] = None
     ):
-        if req.kv_export_spec is None or req.kv_exports:
+        if req.kv_export_spec is None:
             return
         spec = req.kv_export_spec
+        existing_exports = list(req.kv_exports or [])
+        if existing_exports and not (
+            getattr(spec, "materialize_graft_prefix", False)
+            and req.synthetic_prefix_physical_len
+            and req.kv_graft_spec is not None
+        ):
+            return
         committed_len = (
             int(committed_len_override)
             if committed_len_override is not None
@@ -548,6 +602,26 @@ class Scheduler(
             origin_start = spec.origin_start
         else:
             origin_start = token_start
+        if any(
+            existing.token_count == len(token_ids)
+            and getattr(existing, "origin_start", None) == origin_start
+            for existing in existing_exports
+        ):
+            return
+        transform_provenance = (
+            [
+                segment.transform
+                for segment in req.kv_graft_spec.segments
+                if segment.transform is not None
+            ]
+            if req.kv_graft_spec and req.kv_graft_spec.segments
+            else None
+        )
+        materialized = bool(
+            composite
+            and token_start == 0
+            and req.kv_graft_spec is not None
+        )
         meta = self.kv_handle_registry.register(
             allocator=self.token_to_kv_pool_allocator,
             device_indices=device_indices,
@@ -564,8 +638,10 @@ class Scheduler(
                 if req.kv_graft_spec and req.kv_graft_spec.segments
                 else None
             ),
+            materialized=materialized,
+            transform_provenance=transform_provenance,
         )
-        req.kv_exports = [meta]
+        req.kv_exports = existing_exports + [meta]
 
     def _maybe_register_prefill_graft_export(self, req: Req):
         if not req.graft_export_after_prefill:
@@ -2050,7 +2126,16 @@ class Scheduler(
                 time_stats=recv_req.time_stats,
             )
             req.tokenizer = self.tokenizer
-            self._apply_kv_graft(req, recv_req)
+            try:
+                self._apply_kv_graft(req, recv_req)
+            except (RuntimeError, KeyError, ValueError) as e:
+                error_msg = f"KV graft failed: {e}"
+                logger.warning(error_msg)
+                prepare_abort(
+                    req, error_msg, status_code=HTTPStatus.SERVICE_UNAVAILABLE
+                )
+                self.stream_output([req], req.return_logprob)
+                return
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -2675,7 +2760,7 @@ class Scheduler(
         )
 
         if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
+            self.chunked_req.init_next_round_input(self.tree_cache)
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
