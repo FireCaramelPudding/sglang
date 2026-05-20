@@ -9,6 +9,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.managers.io_struct import KVExportSpec
+from sglang.srt.managers.kv_handle_registry import KVHandleRegistry
 from sglang.srt.managers.kv_graft_materializer import (
     MHAGraftMaterializer,
     MLAGraftMaterializer,
@@ -188,6 +189,24 @@ class _MaterializerRecorder:
 
     def transform_segment(self, **kwargs):
         self.calls.append(kwargs)
+
+
+class _HandleAllocatorRecorder:
+    def __init__(self):
+        self.device = torch.device("cpu")
+        self.page_size = 1
+        self.held = []
+        self.released = []
+        self.freed = []
+
+    def hold(self, indices):
+        self.held.append(indices.clone())
+
+    def release_hold(self, indices):
+        self.released.append(indices.clone())
+
+    def free(self, indices):
+        self.freed.append(indices.clone())
 
 
 class _GuardedReq:
@@ -397,6 +416,37 @@ class _FinishedCacheReq:
 
 
 class TestKVGraftRegressions(unittest.TestCase):
+    def test_kv_handle_register_generates_unique_handles_for_same_rid(self):
+        registry = KVHandleRegistry(model_key="model", backend="mha")
+        allocator = _HandleAllocatorRecorder()
+
+        first = registry.register(
+            allocator=allocator,
+            device_indices=torch.tensor([1, 2], dtype=torch.int64),
+            token_ids=[11, 12],
+            origin_start=0,
+            dtype="torch.bfloat16",
+            created_from_rid="same_rid",
+            ttl_seconds=300,
+            persist=True,
+        )
+        second = registry.register(
+            allocator=allocator,
+            device_indices=torch.tensor([3, 4, 5], dtype=torch.int64),
+            token_ids=[13, 14, 15],
+            origin_start=0,
+            dtype="torch.bfloat16",
+            created_from_rid="same_rid",
+            ttl_seconds=300,
+            persist=True,
+        )
+
+        self.assertNotEqual(first.handle, second.handle)
+        self.assertTrue(first.handle.startswith("kvh_same_rid_"))
+        self.assertTrue(second.handle.startswith("kvh_same_rid_"))
+        self.assertEqual(set(registry._entries.keys()), {first.handle, second.handle})
+        self.assertEqual(len(allocator.held), 2)
+
     def test_mha_transform_rescales_before_rope(self):
         kv_pool = _FakeKVPool()
         materializer = _RecordingMHAMaterializer(kv_pool)

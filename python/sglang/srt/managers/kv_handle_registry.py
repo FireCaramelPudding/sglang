@@ -250,12 +250,14 @@ class KVHandleRegistry:
 
         return held_items
 
-    def _new_handle(self, name: Optional[str] = None, created_from_rid: Optional[str] = None) -> str:
+    def _new_handle(
+        self, name: Optional[str] = None, created_from_rid: Optional[str] = None
+    ) -> str:
         prefix = "kvh"
         if name:
             return f"{prefix}_{name}_{uuid.uuid4().hex}"
         if created_from_rid:
-            return f"{prefix}_{created_from_rid}"
+            return f"{prefix}_{created_from_rid}_{uuid.uuid4().hex}"
         return f"{prefix}_{uuid.uuid4().hex}"
 
     def register(
