@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -8,7 +9,7 @@ from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
-from sglang.srt.managers.io_struct import KVExportSpec
+from sglang.srt.managers.io_struct import KVExportSpec, ReleaseKVHandlesReqOutput
 from sglang.srt.managers.kv_handle_registry import KVHandleRegistry
 from sglang.srt.managers.kv_graft_materializer import (
     MHAGraftMaterializer,
@@ -17,6 +18,7 @@ from sglang.srt.managers.kv_graft_materializer import (
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import CacheAwarePolicy, SchedulePolicy
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -207,6 +209,16 @@ class _HandleAllocatorRecorder:
 
     def free(self, indices):
         self.freed.append(indices.clone())
+
+
+class _ReleaseCommunicatorRecorder:
+    def __init__(self, results):
+        self.results = results
+        self.seen_handles = None
+
+    async def __call__(self, recv_req):
+        self.seen_handles = list(recv_req.handles)
+        return self.results
 
 
 class _GuardedReq:
@@ -446,6 +458,75 @@ class TestKVGraftRegressions(unittest.TestCase):
         self.assertTrue(second.handle.startswith("kvh_same_rid_"))
         self.assertEqual(set(registry._entries.keys()), {first.handle, second.handle})
         self.assertEqual(len(allocator.held), 2)
+
+    def test_kv_handle_register_accepts_explicit_handle(self):
+        registry = KVHandleRegistry(model_key="model", backend="mha")
+        allocator = _HandleAllocatorRecorder()
+
+        meta = registry.register(
+            allocator=allocator,
+            device_indices=torch.tensor([7, 8], dtype=torch.int64),
+            token_ids=[11, 12],
+            origin_start=0,
+            dtype="torch.bfloat16",
+            created_from_rid="same_rid",
+            ttl_seconds=300,
+            persist=True,
+            handle="kvh_same_rid_export0",
+        )
+
+        self.assertEqual(meta.handle, "kvh_same_rid_export0")
+        self.assertIn("kvh_same_rid_export0", registry._entries)
+        self.assertEqual(registry._entries[meta.handle].device_indices.tolist(), [7, 8])
+
+    def test_scheduler_export_handle_is_deterministic(self):
+        first = Scheduler._kv_export_handle(
+            SimpleNamespace(), SimpleNamespace(rid="rid123"), 0
+        )
+        second = Scheduler._kv_export_handle(
+            SimpleNamespace(), SimpleNamespace(rid="rid123"), 0
+        )
+        other_slot = Scheduler._kv_export_handle(
+            SimpleNamespace(), SimpleNamespace(rid="rid123"), 1
+        )
+
+        self.assertEqual(first, second)
+        self.assertEqual(first, "kvh_rid123_export0")
+        self.assertEqual(other_slot, "kvh_rid123_export1")
+
+    def test_release_kv_handles_dedupes_and_aggregates_rank_success(self):
+        communicator = _ReleaseCommunicatorRecorder(
+            [
+                ReleaseKVHandlesReqOutput(
+                    success=True,
+                    released_handles=["kvh_shared"],
+                    missing_handles=[],
+                    message="",
+                ),
+                ReleaseKVHandlesReqOutput(
+                    success=False,
+                    released_handles=[],
+                    missing_handles=["kvh_shared"],
+                    message="Missing handles: ['kvh_shared']",
+                ),
+            ]
+        )
+        fake_manager = SimpleNamespace(
+            auto_create_handle_loop=lambda: None,
+            release_kv_handles_communicator=communicator,
+        )
+
+        ret = asyncio.run(
+            TokenizerCommunicatorMixin.release_kv_handles(
+                fake_manager, ["kvh_shared", "kvh_shared"]
+            )
+        )
+
+        self.assertEqual(communicator.seen_handles, ["kvh_shared"])
+        self.assertTrue(ret.success)
+        self.assertEqual(ret.released_handles, ["kvh_shared"])
+        self.assertEqual(ret.missing_handles, [])
+        self.assertEqual(ret.message, "")
 
     def test_mha_transform_rescales_before_rope(self):
         kv_pool = _FakeKVPool()

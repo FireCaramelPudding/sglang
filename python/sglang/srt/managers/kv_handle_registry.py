@@ -276,8 +276,11 @@ class KVHandleRegistry:
         transform: Optional[KVTransformSpec] = None,
         materialized: bool = False,
         transform_provenance: Optional[List[KVTransformSpec]] = None,
+        handle: Optional[str] = None,
     ) -> KVHandleMeta:
-        handle = self._new_handle(name, created_from_rid=created_from_rid)
+        handle = handle or self._new_handle(name, created_from_rid=created_from_rid)
+        if handle in self._entries and not self._entries[handle].released:
+            raise ValueError(f"KV handle already exists: {handle}")
         indices = device_indices.detach().clone().to(dtype=torch.int64)
         allocator.hold(indices)
         meta = KVHandleMeta(

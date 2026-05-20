@@ -465,13 +465,23 @@ class TokenizerCommunicatorMixin:
         self: TokenizerManager, handles: List[str]
     ) -> ReleaseKVHandlesReqOutput:
         self.auto_create_handle_loop()
+        unique_handles = list(dict.fromkeys(handles))
+        if not unique_handles:
+            return ReleaseKVHandlesReqOutput(
+                success=True,
+                released_handles=[],
+                missing_handles=[],
+                message="",
+            )
         results = await self.release_kv_handles_communicator(
-            ReleaseKVHandlesReqInput(handles=handles)
+            ReleaseKVHandlesReqInput(handles=unique_handles)
         )
-        all_success = all(r.success for r in results)
-        released_handles = [h for r in results for h in r.released_handles]
-        missing_handles = [h for r in results for h in r.missing_handles]
-        message = " | ".join([r.message for r in results if r.message])
+        released_set = {h for r in results for h in r.released_handles}
+        released_handles = [h for h in unique_handles if h in released_set]
+        missing_handles = [h for h in unique_handles if h not in released_set]
+        all_success = not missing_handles
+        messages = [r.message for r in results if r.message]
+        message = "" if all_success else " | ".join(messages)
         return ReleaseKVHandlesReqOutput(
             success=all_success,
             released_handles=released_handles,

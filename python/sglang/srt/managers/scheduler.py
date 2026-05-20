@@ -311,6 +311,12 @@ class Scheduler(
         token_end = export_spec.token_end
         return token_end is not None and token_end <= prompt_len
 
+    def _kv_export_handle(self, req: Req, export_index: int) -> str:
+        # All TP ranks process the same request but store rank-local KV pages.
+        # Use a deterministic external handle so every rank registers the same
+        # handle string while keeping its own local device indices.
+        return f"kvh_{req.rid}_export{export_index}"
+
     def _resolve_graft_segment(
         self, req: Req, segment, current_prefix_indices: List[int], current_prefix_tokens: List[int]
     ) -> tuple[torch.Tensor, List[int], bool]:
@@ -539,6 +545,9 @@ class Scheduler(
                 transform=None,
                 materialized=True,
                 transform_provenance=transform_provenance,
+                handle=Scheduler._kv_export_handle(
+                    self, req, len(req.kv_exports or [])
+                ),
             )
             req.kv_exports = [meta]
             logger.info(
@@ -642,6 +651,7 @@ class Scheduler(
             ),
             materialized=materialized,
             transform_provenance=transform_provenance,
+            handle=Scheduler._kv_export_handle(self, req, len(existing_exports)),
         )
         req.kv_exports = existing_exports + [meta]
 
