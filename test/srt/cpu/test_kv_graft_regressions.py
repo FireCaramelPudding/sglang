@@ -158,6 +158,30 @@ class _AllocRecorder:
         return self.next_alloc.clone()
 
 
+class _AllocAfterEvict:
+    def __init__(self):
+        self.calls = 0
+        self.next_alloc = torch.tensor([20, 21], dtype=torch.int64)
+
+    def alloc(self, numel):
+        self.calls += 1
+        assert numel == self.next_alloc.numel()
+        if self.calls == 1:
+            return None
+        return self.next_alloc.clone()
+
+
+class _EvictRecorder:
+    def __init__(self):
+        self.calls = []
+
+    def evict(self, params):
+        if not hasattr(params, "num_tokens"):
+            raise AssertionError("tree_cache.evict expects EvictParams")
+        self.calls.append(params)
+        return SimpleNamespace(num_tokens_evicted=params.num_tokens)
+
+
 class _MaterializerRecorder:
     def __init__(self):
         self.calls = []
@@ -635,6 +659,50 @@ class TestKVGraftRegressions(unittest.TestCase):
         self.assertEqual(len(materializer.calls), 1)
         self.assertEqual(materializer.calls[0]["origin_start"], 700)
         self.assertEqual(materializer.calls[0]["source_indices"].tolist(), [13])
+
+    def test_graft_transform_evicts_with_evict_params_after_alloc_miss(self):
+        entry = SimpleNamespace(
+            meta=SimpleNamespace(model_key="model", backend="mha", origin_start=0),
+            device_indices=torch.tensor([10, 11], dtype=torch.int64),
+            token_ids=[100, 101],
+        )
+        allocator = _AllocAfterEvict()
+        evict_recorder = _EvictRecorder()
+        materializer = _MaterializerRecorder()
+        fake_scheduler = SimpleNamespace(
+            kv_handle_registry=_LookupRegistry(entry),
+            tree_cache=evict_recorder,
+            token_to_kv_pool_allocator=allocator,
+            kv_graft_materializer=materializer,
+            _graft_layer_ids=lambda: [0],
+        )
+        segment = SimpleNamespace(
+            handle="kvh_test",
+            token_start=None,
+            token_end=None,
+            origin_start=0,
+            transform=SimpleNamespace(
+                rope_shift="on",
+                rescale_profile=None,
+                rescale_params=None,
+            ),
+        )
+
+        new_indices, token_ids, is_owned = Scheduler._resolve_graft_segment(
+            fake_scheduler,
+            req=None,
+            segment=segment,
+            current_prefix_indices=[],
+            current_prefix_tokens=[],
+        )
+
+        self.assertTrue(is_owned)
+        self.assertEqual(token_ids, [100, 101])
+        self.assertEqual(new_indices.tolist(), [20, 21])
+        self.assertEqual(allocator.calls, 2)
+        self.assertEqual(len(evict_recorder.calls), 1)
+        self.assertEqual(evict_recorder.calls[0].num_tokens, 2)
+        self.assertEqual(len(materializer.calls), 1)
 
     def test_graft_transform_uses_segment_origin_for_pre_sliced_handle(self):
         entry = SimpleNamespace(

@@ -191,6 +191,7 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 )
 from sglang.srt.managers.session_controller import SessionController
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -374,17 +375,18 @@ class Scheduler(
         new_indices = self.token_to_kv_pool_allocator.alloc(slice_indices.numel())
         if new_indices is None:
             num_needed = slice_indices.numel()
-            evicted = self.tree_cache.evict(num_needed)
+            evicted = self.tree_cache.evict(EvictParams(num_tokens=num_needed))
+            num_evicted = getattr(evicted, "num_tokens_evicted", 0)
             logger.warning(
                 "[kv_graft alloc] first attempt failed (need=%s), evicted %s tokens from radix cache, retrying",
                 num_needed,
-                len(evicted) if evicted else 0,
+                num_evicted,
             )
             new_indices = self.token_to_kv_pool_allocator.alloc(num_needed)
             if new_indices is None:
                 raise RuntimeError(
                     f"Failed to allocate KV pages for graft transform "
-                    f"(need={num_needed}, evicted={len(evicted) if evicted else 0})"
+                    f"(need={num_needed}, evicted={num_evicted})"
                 )
 
         if reference_handle:
