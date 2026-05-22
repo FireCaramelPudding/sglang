@@ -464,6 +464,13 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     if getattr(req, "disable_radix_match", False):
+        # Defensive cleanup for requests created before graft chunked-prefill
+        # stashing was made radix-free, or for any caller that accidentally
+        # locked a tree node before setting disable_radix_match.
+        if getattr(req, "last_node", None) is not None:
+            tree_cache.dec_lock_ref(req.last_node)
+            req.last_node = None
+
         # Synthetic prefix ownership is independent from kv_committed_len.
         # A request can be aborted before any KV commit, while graft alias/owned
         # pages were already held/allocated during request construction.

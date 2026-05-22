@@ -19,6 +19,7 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import CacheAwarePolicy, SchedulePolicy
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -219,6 +220,18 @@ class _ReleaseCommunicatorRecorder:
     async def __call__(self, recv_req):
         self.seen_handles = list(recv_req.handles)
         return self.results
+
+
+class _TreeCacheRecorder:
+    def __init__(self):
+        self.cache_unfinished_calls = []
+        self.dec_lock_ref_calls = []
+
+    def cache_unfinished_req(self, req, chunked=False):
+        self.cache_unfinished_calls.append((req, chunked))
+
+    def dec_lock_ref(self, node):
+        self.dec_lock_ref_calls.append(node)
 
 
 class _GuardedReq:
@@ -1228,6 +1241,37 @@ class TestKVGraftRegressions(unittest.TestCase):
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [])
         self.assertEqual(recorded, {"retractable_tokens": 5, "count_retracted": True})
+
+    def test_stash_chunked_request_skips_radix_cache_for_graft(self):
+        scheduler = SimpleNamespace(tree_cache=_TreeCacheRecorder())
+        req = SimpleNamespace(disable_radix_match=True)
+
+        Scheduler.stash_chunked_request(scheduler, req)
+
+        self.assertEqual(scheduler.tree_cache.cache_unfinished_calls, [])
+
+    def test_stash_chunked_request_keeps_normal_radix_cache_path(self):
+        scheduler = SimpleNamespace(tree_cache=_TreeCacheRecorder())
+        req = SimpleNamespace(disable_radix_match=False)
+
+        Scheduler.stash_chunked_request(scheduler, req)
+
+        self.assertEqual(scheduler.tree_cache.cache_unfinished_calls, [(req, True)])
+
+    def test_release_graft_req_unlocks_accidental_radix_node(self):
+        tree_cache = _TreeCacheRecorder()
+        req = SimpleNamespace(
+            disable_radix_match=True,
+            last_node="locked-node",
+            graft_owned_indices=torch.empty((0,), dtype=torch.int64),
+            graft_aliased_indices=torch.empty((0,), dtype=torch.int64),
+            req_pool_idx=None,
+        )
+
+        release_kv_cache(req, tree_cache)
+
+        self.assertEqual(tree_cache.dec_lock_ref_calls, ["locked-node"])
+        self.assertIsNone(req.last_node)
 
 
 if __name__ == "__main__":

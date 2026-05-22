@@ -2517,6 +2517,11 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def stash_chunked_request(self, req: Req):
+        if getattr(req, "disable_radix_match", False):
+            # KV-graft requests manage synthetic prefix ownership explicitly.
+            # Caching their intermediate chunks in the radix tree would make the
+            # tree and graft cleanup both own the same KV pages.
+            return
         self.tree_cache.cache_unfinished_req(req, chunked=True)
 
     def _build_hisparse_decode_batch(self, reqs):
