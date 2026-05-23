@@ -119,6 +119,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
     KVExportSpec,
+    KVCompressionSpec,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
@@ -179,6 +180,7 @@ from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
+
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.scheduler_profiler_mixin import SchedulerProfilerMixin
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
@@ -249,6 +251,18 @@ else:
 
 logger = logging.getLogger(__name__)
 
+
+@dataclass
+class KVExportPayload:
+    device_indices: torch.Tensor
+    token_ids: List[int]
+    origin_start: int
+    compressed: bool = False
+    compression_type: Optional[str] = None
+    original_token_count: Optional[int] = None
+    compressed_token_count: Optional[int] = None
+    compression_spans: Optional[List[Tuple[int, int]]] = None
+
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
@@ -316,6 +330,216 @@ class Scheduler(
         # Use a deterministic external handle so every rank registers the same
         # handle string while keeping its own local device indices.
         return f"kvh_{req.rid}_export{export_index}"
+
+    @staticmethod
+    def _merge_kv_compression_spans(
+        spans: List[Tuple[int, int]], total_len: int
+    ) -> List[Tuple[int, int]]:
+        merged: List[Tuple[int, int]] = []
+        for start, end in sorted(spans):
+            start = max(0, min(int(start), total_len))
+            end = max(0, min(int(end), total_len))
+            if end <= start:
+                continue
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        return merged
+
+    @staticmethod
+    def _select_old_sparse_spans(
+        total_len: int, compression: KVCompressionSpec
+    ) -> List[Tuple[int, int]]:
+        if total_len <= 0:
+            return []
+        uses_round_trigger = (
+            compression.compress_after_rounds is not None
+            and compression.current_round is not None
+        )
+        if uses_round_trigger and int(compression.current_round) <= int(
+            compression.compress_after_rounds
+        ):
+            return [(0, total_len)]
+        if not uses_round_trigger and total_len <= int(compression.compress_after_tokens):
+            return [(0, total_len)]
+
+        budget = min(int(compression.max_tokens), total_len)
+        prefix_end = min(
+            max(
+                0,
+                int(
+                    compression.protected_prefix_tokens
+                    if compression.protected_prefix_tokens is not None
+                    else compression.sink_tokens
+                ),
+            ),
+            total_len,
+        )
+        if compression.protected_tail_start_token is not None:
+            tail_start = min(
+                max(prefix_end, int(compression.protected_tail_start_token)),
+                total_len,
+            )
+        else:
+            recent_len = min(
+                max(0, int(compression.recent_tokens)),
+                max(0, total_len - prefix_end),
+            )
+            tail_start = max(prefix_end, total_len - recent_len)
+
+        spans: List[Tuple[int, int]] = []
+        if prefix_end > 0:
+            spans.append((0, prefix_end))
+
+        middle_start = prefix_end
+        middle_end = tail_start
+        middle_len = max(0, middle_end - middle_start)
+        protected_len = prefix_end + max(0, total_len - tail_start)
+        anchor_budget = max(0, budget - protected_len)
+        anchor_count = min(max(0, int(compression.anchor_spans)), anchor_budget)
+        if middle_len > 0 and anchor_count > 0 and anchor_budget > 0:
+            anchor_len = max(1, anchor_budget // anchor_count)
+            for idx in range(anchor_count):
+                if middle_len <= anchor_len:
+                    start = middle_start
+                else:
+                    frac = float(idx + 1) / float(anchor_count + 1)
+                    start = middle_start + int(round((middle_len - anchor_len) * frac))
+                end = min(start + anchor_len, middle_end)
+                spans.append((start, end))
+
+        if tail_start < total_len:
+            spans.append((tail_start, total_len))
+
+        return Scheduler._merge_kv_compression_spans(spans, total_len)
+
+    def _alloc_kv_indices_with_eviction(self, num_tokens: int) -> torch.Tensor:
+        page_size = max(1, int(getattr(self.token_to_kv_pool_allocator, "page_size", 1)))
+        alloc_tokens = (
+            ((num_tokens + page_size - 1) // page_size) * page_size
+            if page_size > 1
+            else num_tokens
+        )
+        new_indices = self.token_to_kv_pool_allocator.alloc(alloc_tokens)
+        if new_indices is not None:
+            return new_indices[:num_tokens]
+
+        evicted = self.tree_cache.evict(EvictParams(num_tokens=alloc_tokens))
+        num_evicted = getattr(evicted, "num_tokens_evicted", 0)
+        logger.warning(
+            "[kv_export compression alloc] first attempt failed (need=%s), evicted %s tokens from radix cache, retrying",
+            alloc_tokens,
+            num_evicted,
+        )
+        new_indices = self.token_to_kv_pool_allocator.alloc(alloc_tokens)
+        if new_indices is None:
+            raise RuntimeError(
+                f"Failed to allocate KV pages for compressed export "
+                f"(need={alloc_tokens}, evicted={num_evicted})"
+            )
+        return new_indices[:num_tokens]
+
+    def _copy_old_sparse_compressed_kv(
+        self,
+        *,
+        source_indices: torch.Tensor,
+        dst_indices: torch.Tensor,
+        spans: List[Tuple[int, int]],
+        origin_start: int,
+    ) -> None:
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        dst_cursor = 0
+        if self.kv_handle_registry.backend == "mla":
+            for start, end in spans:
+                span_len = end - start
+                old_indices = source_indices[start:end]
+                new_indices = dst_indices[dst_cursor : dst_cursor + span_len]
+                delta = dst_cursor - start
+                for layer_id in self._graft_layer_ids():
+                    layer_stub = self._make_layer_stub(layer_id)
+                    k_nope, k_rope = kv_pool.get_mla_kv_buffer(
+                        layer_stub, old_indices
+                    )
+                    k_nope = k_nope.clone()
+                    k_rope = k_rope.clone()
+                    if delta != 0:
+                        k_rope = self.kv_graft_materializer._rope_shift_tensor(
+                            k_rope, delta, origin_start=origin_start + start
+                        )
+                    kv_pool.set_mla_kv_buffer(layer_stub, new_indices, k_nope, k_rope)
+                dst_cursor += span_len
+            return
+
+        for start, end in spans:
+            span_len = end - start
+            old_indices = source_indices[start:end]
+            new_indices = dst_indices[dst_cursor : dst_cursor + span_len]
+            delta = dst_cursor - start
+            for layer_id in self._graft_layer_ids():
+                k = kv_pool.get_key_buffer(layer_id)[old_indices].clone()
+                v = kv_pool.get_value_buffer(layer_id)[old_indices].clone()
+                if delta != 0:
+                    k = self.kv_graft_materializer._rope_shift_tensor(
+                        k, delta, origin_start=origin_start + start
+                    )
+                kv_pool.get_key_buffer(layer_id)[new_indices] = k
+                kv_pool.get_value_buffer(layer_id)[new_indices] = v
+            dst_cursor += span_len
+
+    def _maybe_compress_kv_export_payload(
+        self,
+        *,
+        device_indices: torch.Tensor,
+        token_ids: List[int],
+        origin_start: int,
+        compression: Optional[KVCompressionSpec],
+    ) -> KVExportPayload:
+        if compression is None:
+            return KVExportPayload(device_indices, token_ids, origin_start)
+
+        if compression.profile != "old_sparse":
+            raise ValueError(
+                f"KV compression profile {compression.profile!r} is reserved but not implemented"
+            )
+
+        total_len = len(token_ids)
+        spans = self._select_old_sparse_spans(total_len, compression)
+        kept_len = sum(end - start for start, end in spans)
+        if kept_len <= 0 or kept_len >= total_len:
+            return KVExportPayload(device_indices, token_ids, origin_start)
+
+        # Compact into the existing export pages instead of allocating a second
+        # KV block. This avoids the transient "dense full KV + compressed KV"
+        # memory peak that can OOM under high concurrency.
+        compressed_indices = device_indices[:kept_len]
+        self._copy_old_sparse_compressed_kv(
+            source_indices=device_indices,
+            dst_indices=compressed_indices,
+            spans=spans,
+            origin_start=origin_start,
+        )
+        compressed_token_ids = [
+            token_id
+            for start, end in spans
+            for token_id in token_ids[start:end]
+        ]
+        logger.info(
+            "[kv_export compression] profile=old_sparse original_tokens=%s compressed_tokens=%s spans=%s",
+            total_len,
+            len(compressed_token_ids),
+            spans,
+        )
+        return KVExportPayload(
+            device_indices=compressed_indices,
+            token_ids=compressed_token_ids,
+            origin_start=0,
+            compressed=True,
+            compression_type="old_sparse",
+            original_token_count=total_len,
+            compressed_token_count=len(compressed_token_ids),
+            compression_spans=spans,
+        )
 
     def _resolve_graft_segment(
         self, req: Req, segment, current_prefix_indices: List[int], current_prefix_tokens: List[int]
@@ -531,11 +755,17 @@ class Scheduler(
                 for segment in recv_req.kv_graft.segments
                 if segment.transform is not None
             ]
-            meta = self.kv_handle_registry.register(
-                allocator=self.token_to_kv_pool_allocator,
+            payload = self._maybe_compress_kv_export_payload(
                 device_indices=req.synthetic_prefix_indices,
                 token_ids=req.synthetic_prefix_token_ids,
                 origin_start=0,
+                compression=spec.compression,
+            )
+            meta = self.kv_handle_registry.register(
+                allocator=self.token_to_kv_pool_allocator,
+                device_indices=payload.device_indices,
+                token_ids=payload.token_ids,
+                origin_start=payload.origin_start,
                 dtype=str(self.tp_worker.model_runner.kv_cache_dtype),
                 created_from_rid=req.rid,
                 ttl_seconds=spec.ttl_seconds,
@@ -545,6 +775,11 @@ class Scheduler(
                 transform=None,
                 materialized=True,
                 transform_provenance=transform_provenance,
+                compressed=payload.compressed,
+                compression_type=payload.compression_type,
+                original_token_count=payload.original_token_count,
+                compressed_token_count=payload.compressed_token_count,
+                compression_spans=payload.compression_spans,
                 handle=Scheduler._kv_export_handle(
                     self, req, len(req.kv_exports or [])
                 ),
@@ -633,11 +868,17 @@ class Scheduler(
             and token_start == 0
             and req.kv_graft_spec is not None
         )
-        meta = self.kv_handle_registry.register(
-            allocator=self.token_to_kv_pool_allocator,
+        payload = self._maybe_compress_kv_export_payload(
             device_indices=device_indices,
             token_ids=token_ids,
             origin_start=origin_start,
+            compression=spec.compression if materialized else None,
+        )
+        meta = self.kv_handle_registry.register(
+            allocator=self.token_to_kv_pool_allocator,
+            device_indices=payload.device_indices,
+            token_ids=payload.token_ids,
+            origin_start=payload.origin_start,
             dtype=str(self.tp_worker.model_runner.kv_cache_dtype),
             created_from_rid=req.rid,
             ttl_seconds=spec.ttl_seconds,
@@ -651,6 +892,11 @@ class Scheduler(
             ),
             materialized=materialized,
             transform_provenance=transform_provenance,
+            compressed=payload.compressed,
+            compression_type=payload.compression_type,
+            original_token_count=payload.original_token_count,
+            compressed_token_count=payload.compressed_token_count,
+            compression_spans=payload.compression_spans,
             handle=Scheduler._kv_export_handle(self, req, len(existing_exports)),
         )
         req.kv_exports = existing_exports + [meta]

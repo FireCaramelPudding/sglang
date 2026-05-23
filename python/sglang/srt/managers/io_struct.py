@@ -24,7 +24,7 @@ from abc import ABC
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 
@@ -137,6 +137,47 @@ class KVTransformSpec:
 
 
 @dataclass
+class KVCompressionSpec:
+    profile: Literal["old_sparse", "quant_int8", "quant_int4"] = "old_sparse"
+    compress_after_tokens: int = 32768
+    compress_after_rounds: Optional[int] = None
+    current_round: Optional[int] = None
+    max_tokens: int = 16384
+    sink_tokens: int = 2048
+    recent_tokens: int = 12288
+    keep_recent_rounds: Optional[int] = None
+    protected_prefix_tokens: Optional[int] = None
+    protected_tail_start_token: Optional[int] = None
+    anchor_spans: int = 4
+
+    def __post_init__(self):
+        if self.profile not in {"old_sparse", "quant_int8", "quant_int4"}:
+            raise ValueError(f"Unsupported KV compression profile: {self.profile}")
+        for name in (
+            "compress_after_tokens",
+            "max_tokens",
+            "sink_tokens",
+            "recent_tokens",
+        ):
+            if int(getattr(self, name)) < 0:
+                raise ValueError(f"{name} must be >= 0")
+        if int(self.max_tokens) <= 0:
+            raise ValueError("max_tokens must be positive")
+        if int(self.anchor_spans) < 0:
+            raise ValueError("anchor_spans must be >= 0")
+        if self.compress_after_rounds is not None and int(self.compress_after_rounds) < 0:
+            raise ValueError("compress_after_rounds must be >= 0")
+        if self.current_round is not None and int(self.current_round) < 0:
+            raise ValueError("current_round must be >= 0")
+        if self.keep_recent_rounds is not None and int(self.keep_recent_rounds) < 0:
+            raise ValueError("keep_recent_rounds must be >= 0")
+        for name in ("protected_prefix_tokens", "protected_tail_start_token"):
+            value = getattr(self, name)
+            if value is not None and int(value) < 0:
+                raise ValueError(f"{name} must be >= 0")
+
+
+@dataclass
 class KVGraftSegment:
     handle: str
     token_start: Optional[int] = None
@@ -181,8 +222,11 @@ class KVExportSpec:
     ttl_seconds: int = 300
     name: Optional[str] = None
     materialize_graft_prefix: bool = False
+    compression: Optional[Union[KVCompressionSpec, Dict[str, Any]]] = None
 
     def __post_init__(self):
+        if isinstance(self.compression, dict):
+            self.compression = KVCompressionSpec(**self.compression)
         if self.token_start is not None and self.token_start < 0:
             raise ValueError("token_start must be >= 0")
         if self.token_end is not None and self.token_end < 0:
@@ -212,6 +256,11 @@ class KVHandleMeta:
     transform: Optional[KVTransformSpec] = None
     materialized: bool = False
     transform_provenance: Optional[List[KVTransformSpec]] = None
+    compressed: bool = False
+    compression_type: Optional[str] = None
+    original_token_count: Optional[int] = None
+    compressed_token_count: Optional[int] = None
+    compression_spans: Optional[List[Tuple[int, int]]] = None
 
 
 @dataclass

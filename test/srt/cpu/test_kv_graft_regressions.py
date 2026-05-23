@@ -9,7 +9,11 @@ from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
-from sglang.srt.managers.io_struct import KVExportSpec, ReleaseKVHandlesReqOutput
+from sglang.srt.managers.io_struct import (
+    KVCompressionSpec,
+    KVExportSpec,
+    ReleaseKVHandlesReqOutput,
+)
 from sglang.srt.managers.kv_handle_registry import KVHandleRegistry
 from sglang.srt.managers.kv_graft_materializer import (
     MHAGraftMaterializer,
@@ -220,6 +224,107 @@ class _ReleaseCommunicatorRecorder:
     async def __call__(self, recv_req):
         self.seen_handles = list(recv_req.handles)
         return self.results
+
+
+def test_kv_compression_spec_parses_old_sparse_dict():
+    spec = KVExportSpec(
+        compression={
+            "profile": "old_sparse",
+            "compress_after_rounds": 2,
+            "current_round": 5,
+            "max_tokens": 4,
+            "protected_prefix_tokens": 1,
+            "protected_tail_start_token": 6,
+            "anchor_spans": 1,
+        }
+    )
+
+    assert isinstance(spec.compression, KVCompressionSpec)
+    assert spec.compression.profile == "old_sparse"
+    assert spec.compression.max_tokens == 4
+    assert spec.compression.current_round == 5
+
+
+def test_old_sparse_span_selection_uses_round_boundaries():
+    spec = KVCompressionSpec(
+        profile="old_sparse",
+        compress_after_rounds=2,
+        current_round=5,
+        max_tokens=8,
+        protected_prefix_tokens=3,
+        protected_tail_start_token=28,
+        anchor_spans=2,
+    )
+
+    spans = Scheduler._select_old_sparse_spans(32, spec)
+
+    assert spans[0] == (0, 3)
+    assert spans[-1] == (28, 32)
+    assert sum(end - start for start, end in spans) <= 8
+
+
+def test_old_sparse_span_selection_skips_until_round_threshold():
+    spec = KVCompressionSpec(
+        profile="old_sparse",
+        compress_after_rounds=3,
+        current_round=3,
+        max_tokens=8,
+        protected_prefix_tokens=3,
+        protected_tail_start_token=28,
+        anchor_spans=2,
+    )
+
+    assert Scheduler._select_old_sparse_spans(32, spec) == [(0, 32)]
+
+
+def test_quantized_kv_compression_profiles_are_explicitly_reserved():
+    scheduler = object.__new__(Scheduler)
+    spec = KVCompressionSpec(profile="quant_int8")
+
+    with unittest.TestCase().assertRaisesRegex(
+        ValueError, "reserved but not implemented"
+    ):
+        scheduler._maybe_compress_kv_export_payload(
+            device_indices=torch.tensor([1, 2], dtype=torch.int64),
+            token_ids=[10, 11],
+            origin_start=0,
+            compression=spec,
+        )
+
+
+def test_old_sparse_compression_compacts_into_existing_export_indices():
+    scheduler = object.__new__(Scheduler)
+
+    def fail_if_alloc_called(_num_tokens):
+        raise AssertionError("old_sparse compression should not allocate new KV pages")
+
+    copied = []
+    scheduler._alloc_kv_indices_with_eviction = fail_if_alloc_called
+    scheduler._copy_old_sparse_compressed_kv = lambda **kwargs: copied.append(kwargs)
+    spec = KVCompressionSpec(
+        profile="old_sparse",
+        compress_after_tokens=2,
+        max_tokens=2,
+        sink_tokens=1,
+        recent_tokens=1,
+        anchor_spans=0,
+    )
+    device_indices = torch.tensor([10, 11, 12, 13], dtype=torch.int64)
+    token_ids = [1, 2, 3, 4]
+
+    payload = scheduler._maybe_compress_kv_export_payload(
+        device_indices=device_indices,
+        token_ids=token_ids,
+        origin_start=7,
+        compression=spec,
+    )
+
+    assert payload.device_indices.tolist() == [10, 11]
+    assert payload.token_ids == [1, 4]
+    assert payload.origin_start == 0
+    assert payload.compressed is True
+    assert copied
+    assert copied[0]["dst_indices"].tolist() == [10, 11]
 
 
 class _TreeCacheRecorder:

@@ -276,6 +276,11 @@ class KVHandleRegistry:
         transform: Optional[KVTransformSpec] = None,
         materialized: bool = False,
         transform_provenance: Optional[List[KVTransformSpec]] = None,
+        compressed: bool = False,
+        compression_type: Optional[str] = None,
+        original_token_count: Optional[int] = None,
+        compressed_token_count: Optional[int] = None,
+        compression_spans: Optional[List[tuple[int, int]]] = None,
         handle: Optional[str] = None,
     ) -> KVHandleMeta:
         handle = handle or self._new_handle(name, created_from_rid=created_from_rid)
@@ -297,6 +302,11 @@ class KVHandleRegistry:
             transform=transform,
             materialized=materialized,
             transform_provenance=transform_provenance,
+            compressed=compressed,
+            compression_type=compression_type,
+            original_token_count=original_token_count,
+            compressed_token_count=compressed_token_count,
+            compression_spans=compression_spans,
         )
         entry = KVHandleEntry(
             meta=meta,
