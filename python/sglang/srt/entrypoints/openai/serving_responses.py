@@ -287,6 +287,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         background=request.background,
                         kv_graft=self._get_sgl_kv_fields(request)[0],
                         kv_export=self._get_sgl_kv_fields(request)[1],
+                        kv_text_control=self._get_sgl_kv_fields(request)[2],
                     )
 
                     generator = self._generate_with_builtin_tools(
@@ -1317,6 +1318,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 background=adapted_request.background,
                 kv_graft=adapted_request.kv_graft,
                 kv_export=adapted_request.kv_export,
+                kv_text_control=adapted_request.kv_text_control,
             )
 
             # Update sampling params with reduced max_tokens

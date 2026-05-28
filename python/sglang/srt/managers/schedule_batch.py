@@ -95,7 +95,12 @@ if TYPE_CHECKING:
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-    from sglang.srt.managers.io_struct import KVExportSpec, KVGraftSpec, KVHandleMeta
+    from sglang.srt.managers.io_struct import (
+        KVExportSpec,
+        KVGraftSpec,
+        KVHandleMeta,
+        KVTextControlSpec,
+    )
     from sglang.srt.managers.session_controller import Session
     from sglang.srt.observability.scheduler_metrics_mixin import PrefillStats
     from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -577,6 +582,7 @@ class Req(ReqDllmMixin):
         )
         self.kv_graft_spec: Optional[KVGraftSpec] = None
         self.kv_export_spec: Optional[KVExportSpec] = None
+        self.kv_text_control_spec: Optional[KVTextControlSpec] = None
         self.disable_radix_match: bool = False
         self.graft_backend: Optional[str] = None
         self.graft_export_after_prefill: bool = False

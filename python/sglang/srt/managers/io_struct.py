@@ -182,6 +182,34 @@ class KVCompressionSpec:
 
 
 @dataclass
+class KVKAmplifySpec:
+    token_count: int = 0
+    ratio: float = 1.0
+    mode: Literal["fixed", "auto"] = "fixed"
+
+    def __post_init__(self):
+        if int(self.token_count) < 0:
+            raise ValueError("token_count must be >= 0")
+        if float(self.ratio) <= 0:
+            raise ValueError("ratio must be positive")
+        if self.mode not in {"fixed", "auto"}:
+            raise ValueError(f"Unsupported k_amplify mode: {self.mode}")
+
+
+@dataclass
+class KVTextControlSpec:
+    compression: Optional[Union[KVCompressionSpec, Dict[str, Any]]] = None
+    k_amplify: Optional[Union[KVKAmplifySpec, Dict[str, Any]]] = None
+    recompute_first_token: bool = True
+
+    def __post_init__(self):
+        if isinstance(self.compression, dict):
+            self.compression = KVCompressionSpec(**self.compression)
+        if isinstance(self.k_amplify, dict):
+            self.k_amplify = KVKAmplifySpec(**self.k_amplify)
+
+
+@dataclass
 class KVGraftSegment:
     handle: str
     token_start: Optional[int] = None
@@ -368,6 +396,7 @@ class GenerateReqInput(BaseReq):
     # Cross-context KV graft / export
     kv_graft: Optional[Union[KVGraftSpec, Dict[str, Any]]] = None
     kv_export: Optional[Union[KVExportSpec, Dict[str, Any]]] = None
+    kv_text_control: Optional[Union[KVTextControlSpec, Dict[str, Any]]] = None
 
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
@@ -805,6 +834,7 @@ class GenerateReqInput(BaseReq):
             custom_labels=self.custom_labels,
             kv_graft=self.kv_graft,
             kv_export=self.kv_export,
+            kv_text_control=self.kv_text_control,
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
             external_trace_header=self.external_trace_header,
@@ -886,6 +916,7 @@ class TokenizedGenerateReqInput(BaseReq):
     # Cross-context KV graft / export
     kv_graft: Optional[KVGraftSpec] = None
     kv_export: Optional[KVExportSpec] = None
+    kv_text_control: Optional[KVTextControlSpec] = None
 
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False

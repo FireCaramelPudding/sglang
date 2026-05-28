@@ -120,6 +120,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     KVExportSpec,
     KVCompressionSpec,
+    KVTextControlSpec,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
@@ -747,6 +748,221 @@ class Scheduler(
                         dtype=value_buffer.dtype,
                     )[chunk_offset : chunk_offset + (end - start)]
 
+    def _amplify_text_kv_keys(
+        self,
+        *,
+        device_indices: torch.Tensor,
+        token_count: int,
+        ratio: float,
+    ) -> bool:
+        token_count = min(max(0, int(token_count)), int(device_indices.numel()))
+        ratio = float(ratio)
+        if token_count <= 0 or ratio == 1.0:
+            return False
+
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        target_indices = device_indices[:token_count]
+        if self.kv_handle_registry.backend == "mla":
+            for layer_id in self._graft_layer_ids():
+                layer_stub = self._make_layer_stub(layer_id)
+                k_nope, k_rope = kv_pool.get_mla_kv_buffer(layer_stub, target_indices)
+                kv_pool.set_mla_kv_buffer(
+                    layer_stub,
+                    target_indices,
+                    k_nope * ratio,
+                    k_rope * ratio,
+                )
+            return True
+
+        for layer_id in self._graft_layer_ids():
+            key_buffer = kv_pool.get_key_buffer(layer_id)
+            key_buffer[target_indices] = key_buffer[target_indices] * ratio
+        return True
+
+    def _quant_roundtrip_text_kv_tail(
+        self,
+        *,
+        device_indices: torch.Tensor,
+        tail_start: int,
+        bits: int,
+        chunk_tokens: int,
+    ) -> bool:
+        total_len = int(device_indices.numel())
+        tail_start = max(0, min(int(tail_start), total_len))
+        if tail_start >= total_len:
+            return False
+
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        chunk_tokens = max(1, int(chunk_tokens))
+        for layer_id in self._graft_layer_ids():
+            if self.kv_handle_registry.backend == "mla":
+                layer_stub = self._make_layer_stub(layer_id)
+                for start in range(tail_start, total_len, chunk_tokens):
+                    end = min(total_len, start + chunk_tokens)
+                    indices = device_indices[start:end]
+                    k_nope, k_rope = kv_pool.get_mla_kv_buffer(layer_stub, indices)
+                    k_nope_payload = self._quantize_tensor_to_cpu(k_nope, bits)
+                    k_rope_payload = self._quantize_tensor_to_cpu(k_rope, bits)
+                    kv_pool.set_mla_kv_buffer(
+                        layer_stub,
+                        indices,
+                        self._dequantize_tensor_from_cpu(
+                            k_nope_payload, device=indices.device, dtype=k_nope.dtype
+                        ),
+                        self._dequantize_tensor_from_cpu(
+                            k_rope_payload, device=indices.device, dtype=k_rope.dtype
+                        ),
+                    )
+                continue
+
+            key_buffer = kv_pool.get_key_buffer(layer_id)
+            value_buffer = kv_pool.get_value_buffer(layer_id)
+            for start in range(tail_start, total_len, chunk_tokens):
+                end = min(total_len, start + chunk_tokens)
+                indices = device_indices[start:end]
+                k_payload = self._quantize_tensor_to_cpu(key_buffer[indices], bits)
+                v_payload = self._quantize_tensor_to_cpu(value_buffer[indices], bits)
+                key_buffer[indices] = self._dequantize_tensor_from_cpu(
+                    k_payload, device=indices.device, dtype=key_buffer.dtype
+                )
+                value_buffer[indices] = self._dequantize_tensor_from_cpu(
+                    v_payload, device=indices.device, dtype=value_buffer.dtype
+                )
+        return True
+
+    def _release_text_kv_pruned_indices(
+        self, req: Req, *, old_indices: torch.Tensor, kept_len: int
+    ) -> None:
+        total_len = int(old_indices.numel())
+        kept_len = max(0, min(int(kept_len), total_len))
+        if kept_len >= total_len:
+            return
+
+        page_size = max(1, int(getattr(self.token_to_kv_pool_allocator, "page_size", 1)))
+        free_start = kept_len
+        if page_size > 1 and free_start % page_size:
+            free_start = ((free_start + page_size - 1) // page_size) * page_size
+        if free_start >= total_len:
+            return
+        pruned_indices = old_indices[free_start:total_len].to(torch.int64)
+        if pruned_indices.numel() == 0:
+            return
+        self.token_to_kv_pool_allocator.free(pruned_indices)
+        req.kv_allocated_len = min(req.kv_allocated_len, free_start)
+
+    def _maybe_apply_text_kv_control_after_prefill(self, req: Req) -> bool:
+        spec: Optional[KVTextControlSpec] = getattr(req, "kv_text_control_spec", None)
+        if spec is None:
+            return False
+        if req.kv_graft_spec is not None:
+            raise ValueError("sgl_text_kv_control cannot be used with sgl_kv_graft")
+        if req.req_pool_idx is None:
+            return False
+
+        compression = getattr(spec, "compression", None)
+        k_amplify = getattr(spec, "k_amplify", None)
+        total_len = int(req.prompt_token_count)
+        if total_len <= 0:
+            return False
+
+        old_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :total_len
+        ].to(torch.int64)
+        token_ids = list(req.logical_input_ids)
+        spans = [(0, total_len)]
+        compressed = False
+        quant_roundtrip = False
+
+        if compression is not None and self._kv_compression_triggered(
+            total_len, compression
+        ):
+            spans = self._select_old_sparse_spans(total_len, compression)
+        kept_len = sum(end - start for start, end in spans)
+        if kept_len <= 0:
+            return False
+
+        if kept_len < total_len:
+            compact_indices = old_indices[:kept_len]
+            self._copy_old_sparse_compressed_kv(
+                source_indices=old_indices,
+                dst_indices=compact_indices,
+                spans=spans,
+                origin_start=0,
+            )
+            compact_token_ids = [
+                token_id
+                for start, end in spans
+                for token_id in token_ids[start:end]
+            ]
+            req.origin_input_ids = compact_token_ids
+            req.origin_input_ids_len = len(compact_token_ids)
+            req.synthetic_prefix_token_ids = []
+            req.synthetic_prefix_indices = torch.empty(
+                (0,), dtype=torch.int64, device=compact_indices.device
+            )
+            self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :kept_len
+            ] = compact_indices
+            req.kv_committed_len = min(req.kv_committed_len, kept_len)
+            req.kv_allocated_len = min(req.kv_allocated_len, kept_len)
+            self._release_text_kv_pruned_indices(
+                req, old_indices=old_indices, kept_len=kept_len
+            )
+            compressed = True
+            working_indices = compact_indices
+        else:
+            compact_token_ids = token_ids
+            working_indices = old_indices
+
+        k_amplified = False
+        if k_amplify is not None:
+            k_amplified = self._amplify_text_kv_keys(
+                device_indices=working_indices,
+                token_count=getattr(k_amplify, "token_count", 0),
+                ratio=getattr(k_amplify, "ratio", 1.0),
+            )
+
+        if (
+            compression is not None
+            and compression.profile in {"quant_int8", "quant_int4"}
+            and bool(getattr(compression, "quantize_tail", True))
+            and self._kv_compression_triggered(total_len, compression)
+        ):
+            original_tail_start = self._quantized_tail_start(total_len, compression)
+            tail_start = (
+                self._map_token_pos_to_compressed_offset(spans, original_tail_start)
+                if compressed
+                else original_tail_start
+            )
+            quant_roundtrip = self._quant_roundtrip_text_kv_tail(
+                device_indices=working_indices,
+                tail_start=tail_start,
+                bits=8 if compression.profile == "quant_int8" else 4,
+                chunk_tokens=int(compression.quant_chunk_tokens),
+            )
+
+        if not (compressed or k_amplified or quant_roundtrip):
+            return False
+
+        setattr(req, "text_kv_control_applied", True)
+        setattr(req, "text_kv_control_recompute_first_token", bool(spec.recompute_first_token))
+        logger.info(
+            "[text_kv_control] original_tokens=%s compressed_tokens=%s spans=%s k_amplify=%s quant_roundtrip=%s recompute_first_token=%s",
+            total_len,
+            len(compact_token_ids),
+            spans,
+            {
+                "token_count": getattr(k_amplify, "token_count", 0),
+                "ratio": getattr(k_amplify, "ratio", 1.0),
+                "mode": getattr(k_amplify, "mode", "fixed"),
+            }
+            if k_amplify is not None
+            else None,
+            quant_roundtrip,
+            bool(spec.recompute_first_token),
+        )
+        return True
+
     def _copy_kv_indices(self, source_indices: torch.Tensor, dst_indices: torch.Tensor) -> None:
         if source_indices.numel() == 0:
             return
@@ -1285,12 +1501,18 @@ class Scheduler(
 
     def _apply_kv_graft(self, req: Req, recv_req: TokenizedGenerateReqInput):
         req.kv_export_spec = recv_req.kv_export
+        kv_text_control = getattr(recv_req, "kv_text_control", None)
+        req.kv_text_control_spec = kv_text_control
         input_len = len(recv_req.input_ids) if recv_req.input_ids is not None else 0
+        if recv_req.kv_graft is not None and kv_text_control is not None:
+            raise ValueError("sgl_kv_graft and sgl_text_kv_control are mutually exclusive")
         if recv_req.kv_graft is None:
             req.graft_export_after_prefill = self._should_export_after_prefill(
                 recv_req.kv_export, input_len
             )
-            req.disable_radix_match = req.graft_export_after_prefill
+            req.disable_radix_match = (
+                req.graft_export_after_prefill or kv_text_control is not None
+            )
             return
         (
             req.kv_graft_materialize_tokens,

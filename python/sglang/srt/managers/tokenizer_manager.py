@@ -61,6 +61,7 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     KVGraftSpec,
     KVExportSpec,
+    KVTextControlSpec,
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
@@ -988,6 +989,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     KVExportSpec(**obj.kv_export)
                     if isinstance(obj.kv_export, dict)
                     else obj.kv_export
+                ),
+                kv_text_control=(
+                    KVTextControlSpec(**obj.kv_text_control)
+                    if isinstance(obj.kv_text_control, dict)
+                    else obj.kv_text_control
                 ),
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,

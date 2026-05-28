@@ -163,10 +163,11 @@ class OpenAIServingBase(ABC):
 
     def _get_sgl_kv_fields(
         self, request: Any
-    ) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    ) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
         return (
             getattr(request, "sgl_kv_graft", None),
             getattr(request, "sgl_kv_export", None),
+            getattr(request, "sgl_text_kv_control", None),
         )
 
     def _extract_kv_exports_from_ret(self, ret_item: Dict[str, Any]) -> Optional[Any]:

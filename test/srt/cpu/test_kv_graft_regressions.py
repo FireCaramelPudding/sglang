@@ -12,6 +12,8 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.managers.io_struct import (
     KVCompressionSpec,
     KVExportSpec,
+    KVKAmplifySpec,
+    KVTextControlSpec,
     ReleaseKVHandlesReqOutput,
 )
 from sglang.srt.managers.kv_handle_registry import KVHandleRegistry
@@ -245,6 +247,24 @@ def test_kv_compression_spec_parses_old_sparse_dict():
     assert spec.compression.current_round == 5
 
 
+def test_text_kv_control_spec_parses_nested_dicts():
+    spec = KVTextControlSpec(
+        compression={
+            "profile": "quant_int4",
+            "current_round": 5,
+            "compress_after_rounds": 2,
+            "max_tokens": 4,
+        },
+        k_amplify={"token_count": 2, "ratio": 1.5, "mode": "fixed"},
+    )
+
+    assert isinstance(spec.compression, KVCompressionSpec)
+    assert isinstance(spec.k_amplify, KVKAmplifySpec)
+    assert spec.compression.profile == "quant_int4"
+    assert spec.k_amplify.token_count == 2
+    assert spec.recompute_first_token is True
+
+
 def test_old_sparse_span_selection_uses_round_boundaries():
     spec = KVCompressionSpec(
         profile="old_sparse",
@@ -409,6 +429,89 @@ def test_quantized_kv_compression_prunes_before_quantizing_tail_payload():
     assert torch.equal(
         kv_pool.key_buffers[0][1], torch.tensor([[12.0, 13.0, 14.0, 15.0]])
     )
+
+
+class _TextControlReq:
+    def __init__(self, token_ids):
+        self.rid = "text-control"
+        self.req_pool_idx = 0
+        self.origin_input_ids = list(token_ids)
+        self.origin_input_ids_len = len(token_ids)
+        self.synthetic_prefix_token_ids = []
+        self.synthetic_prefix_indices = torch.empty((0,), dtype=torch.int64)
+        self.kv_graft_spec = None
+        self.kv_committed_len = len(token_ids)
+        self.kv_allocated_len = len(token_ids)
+
+    @property
+    def prompt_token_count(self):
+        return len(self.synthetic_prefix_token_ids) + len(self.origin_input_ids)
+
+    @property
+    def logical_input_ids(self):
+        return self.synthetic_prefix_token_ids + self.origin_input_ids
+
+
+def _make_text_control_scheduler(kv_pool, req_to_token):
+    allocator = _HandleAllocatorRecorder()
+    allocator.get_kvcache = lambda: kv_pool
+    scheduler = object.__new__(Scheduler)
+    scheduler.token_to_kv_pool_allocator = allocator
+    scheduler.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
+    scheduler.kv_handle_registry = SimpleNamespace(backend="mha")
+    scheduler.kv_graft_materializer = _RecordingMHAMaterializer(kv_pool)
+    scheduler._graft_layer_ids = lambda: [0]
+    return scheduler, allocator
+
+
+def test_text_kv_control_k_amplify_only_changes_keys():
+    kv_pool = _FakeKVPool()
+    req_to_token = torch.tensor([[0, 1, 2, 3]], dtype=torch.int64)
+    scheduler, _ = _make_text_control_scheduler(kv_pool, req_to_token)
+    req = _TextControlReq([10, 11, 12, 13])
+    req.kv_text_control_spec = KVTextControlSpec(
+        k_amplify={"token_count": 2, "ratio": 2.0, "mode": "fixed"}
+    )
+    original_values = kv_pool.value_buffers[0].clone()
+
+    applied = Scheduler._maybe_apply_text_kv_control_after_prefill(scheduler, req)
+
+    assert applied is True
+    assert torch.equal(kv_pool.key_buffers[0][0], torch.full((1, 4), 2.0))
+    assert torch.equal(kv_pool.key_buffers[0][1], torch.full((1, 4), 4.0))
+    assert torch.equal(kv_pool.value_buffers[0], original_values)
+    assert req.text_kv_control_recompute_first_token is True
+
+
+def test_text_kv_control_compacts_tokens_and_maps_quant_tail():
+    kv_pool = _FakeKVPool()
+    req_to_token = torch.tensor([[0, 1, 2, 3]], dtype=torch.int64)
+    scheduler, allocator = _make_text_control_scheduler(kv_pool, req_to_token)
+    req = _TextControlReq([10, 11, 12, 13])
+    req.kv_text_control_spec = KVTextControlSpec(
+        compression={
+            "profile": "quant_int8",
+            "compress_after_rounds": 0,
+            "current_round": 2,
+            "max_tokens": 2,
+            "protected_prefix_tokens": 1,
+            "protected_tail_start_token": 3,
+            "anchor_spans": 0,
+            "quantize_tail": True,
+        }
+    )
+    seen = {}
+    scheduler._quant_roundtrip_text_kv_tail = lambda **kwargs: seen.update(kwargs) or True
+
+    applied = Scheduler._maybe_apply_text_kv_control_after_prefill(scheduler, req)
+
+    assert applied is True
+    assert req.origin_input_ids == [10, 13]
+    assert req.kv_committed_len == 2
+    assert torch.equal(req_to_token[0, :2], torch.tensor([0, 1]))
+    assert allocator.freed and torch.equal(allocator.freed[0], torch.tensor([2, 3]))
+    assert seen["tail_start"] == 1
+    assert seen["bits"] == 8
 
 
 def test_resolve_quantized_tail_records_lazy_descriptor_without_full_alloc():
@@ -1012,6 +1115,43 @@ class TestKVGraftRegressions(unittest.TestCase):
         self.assertEqual(req.kv_export_spec, recv_req.kv_export)
         self.assertFalse(req.graft_export_after_prefill)
         self.assertFalse(req.disable_radix_match)
+
+    def test_text_kv_control_disables_radix_match_without_graft(self):
+        fake_scheduler = SimpleNamespace()
+        fake_scheduler._should_export_after_prefill = lambda export_spec, prompt_len: (
+            Scheduler._should_export_after_prefill(
+                fake_scheduler, export_spec, prompt_len
+            )
+        )
+        req = _ApplyGraftReq()
+        recv_req = SimpleNamespace(
+            kv_export=None,
+            input_ids=[1, 2, 3, 4],
+            kv_graft=None,
+            kv_text_control=KVTextControlSpec(
+                k_amplify={"token_count": 1, "ratio": 1.2}
+            ),
+        )
+
+        Scheduler._apply_kv_graft(fake_scheduler, req, recv_req)
+
+        self.assertEqual(req.kv_text_control_spec, recv_req.kv_text_control)
+        self.assertTrue(req.disable_radix_match)
+
+    def test_text_kv_control_rejects_mixed_graft_request(self):
+        fake_scheduler = SimpleNamespace()
+        req = _ApplyGraftReq()
+        recv_req = SimpleNamespace(
+            kv_export=None,
+            input_ids=[1, 2, 3, 4],
+            kv_graft=SimpleNamespace(segments=[]),
+            kv_text_control=KVTextControlSpec(
+                k_amplify={"token_count": 1, "ratio": 1.2}
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            Scheduler._apply_kv_graft(fake_scheduler, req, recv_req)
 
     def test_kv_export_spec_accepts_materialize_graft_prefix(self):
         spec = KVExportSpec(materialize_graft_prefix=True)

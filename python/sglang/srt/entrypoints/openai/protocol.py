@@ -318,6 +318,7 @@ class CompletionRequest(BaseModel):
     # Cross-context KV graft / export
     sgl_kv_graft: Optional[Dict[str, Any]] = None
     sgl_kv_export: Optional[Dict[str, Any]] = None
+    sgl_text_kv_control: Optional[Dict[str, Any]] = None
 
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
@@ -641,6 +642,7 @@ class ChatCompletionRequest(BaseModel):
     # Cross-context KV graft / export
     sgl_kv_graft: Optional[Dict[str, Any]] = None
     sgl_kv_export: Optional[Dict[str, Any]] = None
+    sgl_text_kv_control: Optional[Dict[str, Any]] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None

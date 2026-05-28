@@ -129,6 +129,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             custom_logit_processor=request.custom_logit_processor,
             kv_graft=self._get_sgl_kv_fields(request)[0],
             kv_export=self._get_sgl_kv_fields(request)[1],
+            kv_text_control=self._get_sgl_kv_fields(request)[2],
         )
 
         return adapted_request, request

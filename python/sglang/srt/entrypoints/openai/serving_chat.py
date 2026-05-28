@@ -323,6 +323,7 @@ class OpenAIServingChat(OpenAIServingBase):
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
             kv_graft=self._get_sgl_kv_fields(request)[0],
             kv_export=self._get_sgl_kv_fields(request)[1],
+            kv_text_control=self._get_sgl_kv_fields(request)[2],
         )
 
         return adapted_request, request

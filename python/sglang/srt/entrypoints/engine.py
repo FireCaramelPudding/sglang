@@ -306,6 +306,7 @@ class Engine(EngineBase):
         priority: Optional[int] = None,
         kv_graft: Optional[Dict] = None,
         kv_export: Optional[Dict] = None,
+        kv_text_control: Optional[Dict] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -342,6 +343,7 @@ class Engine(EngineBase):
             priority=priority,
             kv_graft=kv_graft,
             kv_export=kv_export,
+            kv_text_control=kv_text_control,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -400,6 +402,7 @@ class Engine(EngineBase):
         priority: Optional[int] = None,
         kv_graft: Optional[Dict] = None,
         kv_export: Optional[Dict] = None,
+        kv_text_control: Optional[Dict] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -436,6 +439,7 @@ class Engine(EngineBase):
             priority=priority,
             kv_graft=kv_graft,
             kv_export=kv_export,
+            kv_text_control=kv_text_control,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 

@@ -181,6 +181,7 @@ class SchedulerOutputProcessorMixin:
                     # Export the committed prompt prefix before we fold the first
                     # sampled token into request-local output state.
                     self._maybe_register_prefill_graft_export(req)
+                    self._maybe_apply_text_kv_control_after_prefill(req)
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
                     req.check_finished()
