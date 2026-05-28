@@ -94,6 +94,39 @@ class TestPrefillAdder(CustomTestCase):
         defaults.update(kwargs)
         return PrefillAdder(**defaults)
 
+    def test_kv_graft_materialize_admission_defers_over_running_budget(self):
+        running_req = self.create_mock_req("running", 0, 10)
+        running_req.kv_graft_materialize_tokens = 50000
+        pending_req = self.create_mock_req("pending", 0, 10)
+        pending_req.kv_graft_materialize_tokens = 20000
+        adder = self.create_adder(
+            self.create_running_batch([running_req]),
+            kv_graft_max_running_materialize_tokens=60000,
+            kv_graft_max_prefill_materialize_tokens=32768,
+        )
+
+        self.assertEqual(
+            adder.add_one_req(
+                pending_req,
+                has_chunked_req=False,
+                truncation_align_size=None,
+            ),
+            AddReqResult.OTHER,
+        )
+
+    def test_kv_graft_large_single_request_must_enter_prefill_alone(self):
+        req = self.create_mock_req("large", 0, 10)
+        req.kv_graft_materialize_tokens = 50000
+        adder = self.create_adder(
+            self.create_running_batch([]),
+            kv_graft_max_running_materialize_tokens=60000,
+            kv_graft_max_prefill_materialize_tokens=32768,
+        )
+
+        self.assertTrue(adder._check_kv_graft_materialize_admission(req))
+        adder.can_run_list.append(self.create_mock_req("already", 0, 10))
+        self.assertFalse(adder._check_kv_graft_materialize_admission(req))
+
     def test_preempt_success_high_priority_values_first(self):
         params = [
             ("run1", 0, 50),

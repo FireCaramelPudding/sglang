@@ -22,6 +22,7 @@ class KVHandleEntry:
     external_refcount: int = 1
     released: bool = False
     transform_provenance: Optional[List[KVTransformSpec]] = None
+    quantized_tail: Optional[Dict[str, Any]] = None
 
     def is_expired(self, now: Optional[float] = None) -> bool:
         if self.ttl_expiry is None:
@@ -281,6 +282,9 @@ class KVHandleRegistry:
         original_token_count: Optional[int] = None,
         compressed_token_count: Optional[int] = None,
         compression_spans: Optional[List[tuple[int, int]]] = None,
+        quantized_tail_start_token: Optional[int] = None,
+        quantization_bits: Optional[int] = None,
+        quantized_tail: Optional[Dict[str, Any]] = None,
         handle: Optional[str] = None,
     ) -> KVHandleMeta:
         handle = handle or self._new_handle(name, created_from_rid=created_from_rid)
@@ -307,6 +311,8 @@ class KVHandleRegistry:
             original_token_count=original_token_count,
             compressed_token_count=compressed_token_count,
             compression_spans=compression_spans,
+            quantized_tail_start_token=quantized_tail_start_token,
+            quantization_bits=quantization_bits,
         )
         entry = KVHandleEntry(
             meta=meta,
@@ -318,6 +324,7 @@ class KVHandleRegistry:
             ),
             external_refcount=1 if persist else 0,
             transform_provenance=transform_provenance,
+            quantized_tail=quantized_tail,
         )
         self._entries[handle] = entry
         return meta
@@ -350,6 +357,13 @@ class KVHandleRegistry:
             "token_ids": entry.token_ids,
             "device_indices": entry.device_indices.tolist(),
             "transform_provenance": entry.transform_provenance,
+            "quantized_tail": {
+                "start": entry.quantized_tail.get("start"),
+                "length": entry.quantized_tail.get("length"),
+                "bits": entry.quantized_tail.get("bits"),
+            }
+            if entry.quantized_tail
+            else None,
         }
 
     def add_ref(self, handle: str):

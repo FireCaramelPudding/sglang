@@ -149,6 +149,8 @@ class KVCompressionSpec:
     protected_prefix_tokens: Optional[int] = None
     protected_tail_start_token: Optional[int] = None
     anchor_spans: int = 4
+    quantize_tail: bool = True
+    quant_chunk_tokens: int = 1024
 
     def __post_init__(self):
         if self.profile not in {"old_sparse", "quant_int8", "quant_int4"}:
@@ -165,6 +167,8 @@ class KVCompressionSpec:
             raise ValueError("max_tokens must be positive")
         if int(self.anchor_spans) < 0:
             raise ValueError("anchor_spans must be >= 0")
+        if int(self.quant_chunk_tokens) <= 0:
+            raise ValueError("quant_chunk_tokens must be positive")
         if self.compress_after_rounds is not None and int(self.compress_after_rounds) < 0:
             raise ValueError("compress_after_rounds must be >= 0")
         if self.current_round is not None and int(self.current_round) < 0:
@@ -261,6 +265,8 @@ class KVHandleMeta:
     original_token_count: Optional[int] = None
     compressed_token_count: Optional[int] = None
     compression_spans: Optional[List[Tuple[int, int]]] = None
+    quantized_tail_start_token: Optional[int] = None
+    quantization_bits: Optional[int] = None
 
 
 @dataclass

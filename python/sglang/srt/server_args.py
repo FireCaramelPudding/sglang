@@ -344,6 +344,8 @@ class ServerArgs:
     enable_dynamic_chunking: bool = False
     max_prefill_tokens: int = 16384
     prefill_max_requests: Optional[int] = None
+    kv_graft_max_prefill_materialize_tokens: int = 65536
+    kv_graft_max_running_materialize_tokens: int = 98304
     schedule_policy: str = "fcfs"
     enable_priority_scheduling: bool = False
     disable_priority_preemption: bool = False
@@ -3905,6 +3907,18 @@ class ServerArgs:
             type=int,
             default=ServerArgs.prefill_max_requests,
             help="The maximum number of requests in a prefill batch. If not specified, there is no limit.",
+        )
+        parser.add_argument(
+            "--kv-graft-max-prefill-materialize-tokens",
+            type=int,
+            default=ServerArgs.kv_graft_max_prefill_materialize_tokens,
+            help="Maximum estimated KV graft materialization tokens for one request before it must enter prefill alone.",
+        )
+        parser.add_argument(
+            "--kv-graft-max-running-materialize-tokens",
+            type=int,
+            default=ServerArgs.kv_graft_max_running_materialize_tokens,
+            help="Maximum estimated KV graft materialization tokens across running and newly admitted requests.",
         )
         parser.add_argument(
             "--enable-dynamic-chunking",

@@ -483,6 +483,16 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
         # Nothing was bound to req_to_token_pool yet (e.g. dropped in waiting queue).
         if req.req_pool_idx is None:
+            lazy_live = getattr(req, "lazy_quantized_live_indices", None)
+            if lazy_live:
+                released_tokens = sum(int(indices.numel()) for indices in lazy_live)
+                tree_cache.token_to_kv_pool_allocator.free(torch.cat(lazy_live))
+                logger.info(
+                    "[kv_graft lazy_release] rid=%s released_tokens=%s",
+                    req.rid,
+                    released_tokens,
+                )
+                req.lazy_quantized_live_indices = []
             return
 
         kv_committed_len = req.pop_committed_kv_cache()
@@ -495,6 +505,15 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         live_start = min(synthetic_prefix_len, kv_committed_len)
         if live_start < kv_committed_len:
             tree_cache.token_to_kv_pool_allocator.free(kv_indices[live_start:])
+        lazy_live = getattr(req, "lazy_quantized_live_indices", None)
+        if lazy_live:
+            released_tokens = sum(int(indices.numel()) for indices in lazy_live)
+            logger.info(
+                "[kv_graft lazy_release] rid=%s released_tokens=%s",
+                req.rid,
+                released_tokens,
+            )
+            req.lazy_quantized_live_indices = []
 
         # Owned transformed graft pages live in the request allocation. They are either
         # exported via registry-held references or freed by the allocator free above.

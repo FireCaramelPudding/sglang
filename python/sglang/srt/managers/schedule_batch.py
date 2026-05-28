@@ -588,6 +588,11 @@ class Req(ReqDllmMixin):
         self.graft_prefix_owned_mask: torch.Tensor = torch.empty((0,), dtype=torch.bool)
         self.kv_exports: List[KVHandleMeta] = []
         self.synthetic_prefix_physical_len: int = 0
+        self.kv_graft_materialize_tokens: int = 0
+        self.kv_graft_quantized_tail_tokens: int = 0
+        self.kv_graft_gpu_resident_tokens: int = 0
+        self.lazy_quantized_graft_segments: List[dict] = []
+        self.lazy_quantized_live_indices: List[torch.Tensor] = []
         self.session = session
         self.input_embeds = input_embeds
 
@@ -988,7 +993,12 @@ class Req(ReqDllmMixin):
                     :committed_prefix_len
                 ].to(dtype=torch.int64, copy=True)
             self.cache_protected_len = min(
-                len(self.synthetic_prefix_indices), len(self.prefix_indices)
+                getattr(
+                    self,
+                    "synthetic_prefix_physical_len",
+                    len(self.synthetic_prefix_indices),
+                ),
+                len(self.prefix_indices),
             )
             self.last_node = None
             self.last_host_node = None

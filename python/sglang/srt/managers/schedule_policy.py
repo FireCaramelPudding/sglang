@@ -210,7 +210,12 @@ class SchedulePolicy:
                         :committed_prefix_len
                     ].to(dtype=torch.int64, copy=True)
                 r.cache_protected_len = min(
-                    len(r.synthetic_prefix_indices), len(r.prefix_indices)
+                    getattr(
+                        r,
+                        "synthetic_prefix_physical_len",
+                        len(r.synthetic_prefix_indices),
+                    ),
+                    len(r.prefix_indices),
                 )
                 r.last_node = None
                 r.last_host_node = None
@@ -415,6 +420,8 @@ class PrefillAdder:
         max_prefill_bs: int = 0,
         max_running_requests: Optional[int] = None,
         prefill_max_requests: Optional[int] = None,
+        kv_graft_max_prefill_materialize_tokens: int = 65536,
+        kv_graft_max_running_materialize_tokens: int = 98304,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
     ):
@@ -465,6 +472,63 @@ class PrefillAdder:
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
         self.max_prefill_bs = max_prefill_bs
+        self.kv_graft_max_prefill_materialize_tokens = max(
+            0, int(kv_graft_max_prefill_materialize_tokens or 0)
+        )
+        self.kv_graft_max_running_materialize_tokens = max(
+            0, int(kv_graft_max_running_materialize_tokens or 0)
+        )
+
+    @staticmethod
+    def _req_kv_graft_materialize_tokens(req: Req) -> int:
+        return int(getattr(req, "kv_graft_materialize_tokens", 0) or 0)
+
+    def _current_kv_graft_materialize_tokens(self) -> int:
+        running = (
+            self.running_batch.reqs
+            if self.running_batch is not None
+            else []
+        )
+        return sum(self._req_kv_graft_materialize_tokens(r) for r in running) + sum(
+            self._req_kv_graft_materialize_tokens(r) for r in self.can_run_list
+        )
+
+    def _check_kv_graft_materialize_admission(self, req: Req) -> bool:
+        estimated = self._req_kv_graft_materialize_tokens(req)
+        if estimated <= 0:
+            return True
+
+        running_materialize = self._current_kv_graft_materialize_tokens()
+        max_running = self.kv_graft_max_running_materialize_tokens
+        max_prefill = self.kv_graft_max_prefill_materialize_tokens
+
+        if max_prefill > 0 and estimated > max_prefill:
+            allow = running_materialize == 0 and len(self.can_run_list) == 0
+            logger.info(
+                "[kv_graft admission] rid=%s estimated_materialize=%s running_materialize=%s decision=%s reason=single_request_prefill_limit",
+                req.rid,
+                estimated,
+                running_materialize,
+                "allow" if allow else "defer",
+            )
+            return allow
+
+        if max_running > 0 and running_materialize + estimated > max_running:
+            logger.info(
+                "[kv_graft admission] rid=%s estimated_materialize=%s running_materialize=%s decision=defer reason=running_materialize_limit",
+                req.rid,
+                estimated,
+                running_materialize,
+            )
+            return False
+
+        logger.info(
+            "[kv_graft admission] rid=%s estimated_materialize=%s running_materialize=%s decision=allow",
+            req.rid,
+            estimated,
+            running_materialize,
+        )
+        return True
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
@@ -779,6 +843,9 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
+            return AddReqResult.OTHER
+
+        if not self._check_kv_graft_materialize_admission(req):
             return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):

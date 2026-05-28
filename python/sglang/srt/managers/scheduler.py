@@ -262,6 +262,9 @@ class KVExportPayload:
     original_token_count: Optional[int] = None
     compressed_token_count: Optional[int] = None
     compression_spans: Optional[List[Tuple[int, int]]] = None
+    quantized_tail_start_token: Optional[int] = None
+    quantization_bits: Optional[int] = None
+    quantized_tail: Optional[dict] = None
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
@@ -374,6 +377,7 @@ class Scheduler(
                     else compression.sink_tokens
                 ),
             ),
+            budget,
             total_len,
         )
         if compression.protected_tail_start_token is not None:
@@ -387,6 +391,9 @@ class Scheduler(
                 max(0, total_len - prefix_end),
             )
             tail_start = max(prefix_end, total_len - recent_len)
+        tail_budget = max(0, budget - prefix_end)
+        if total_len - tail_start > tail_budget:
+            tail_start = max(prefix_end, total_len - tail_budget)
 
         spans: List[Tuple[int, int]] = []
         if prefix_end > 0:
@@ -413,6 +420,20 @@ class Scheduler(
             spans.append((tail_start, total_len))
 
         return Scheduler._merge_kv_compression_spans(spans, total_len)
+
+    @staticmethod
+    def _map_token_pos_to_compressed_offset(
+        spans: List[Tuple[int, int]], token_pos: int
+    ) -> int:
+        token_pos = int(token_pos)
+        offset = 0
+        for start, end in spans:
+            if token_pos < start:
+                return offset
+            if token_pos < end:
+                return offset + token_pos - start
+            offset += end - start
+        return offset
 
     def _alloc_kv_indices_with_eviction(self, num_tokens: int) -> torch.Tensor:
         page_size = max(1, int(getattr(self.token_to_kv_pool_allocator, "page_size", 1)))
@@ -487,6 +508,274 @@ class Scheduler(
                 kv_pool.get_value_buffer(layer_id)[new_indices] = v
             dst_cursor += span_len
 
+    @staticmethod
+    def _kv_compression_triggered(
+        total_len: int, compression: KVCompressionSpec
+    ) -> bool:
+        uses_round_trigger = (
+            compression.compress_after_rounds is not None
+            and compression.current_round is not None
+        )
+        if uses_round_trigger:
+            return int(compression.current_round) > int(compression.compress_after_rounds)
+        return total_len > int(compression.compress_after_tokens)
+
+    @staticmethod
+    def _quantized_tail_start(
+        total_len: int, compression: KVCompressionSpec
+    ) -> int:
+        if compression.protected_tail_start_token is not None:
+            return max(0, min(int(compression.protected_tail_start_token), total_len))
+        recent_len = min(max(0, int(compression.recent_tokens)), total_len)
+        return max(0, total_len - recent_len)
+
+    @staticmethod
+    def _pack_int4_tensor(values: torch.Tensor) -> tuple[torch.Tensor, int]:
+        flat = (values.to(torch.int16).flatten() + 8).clamp_(0, 15)
+        original_numel = int(flat.numel())
+        if original_numel % 2:
+            flat = torch.cat([flat, torch.zeros((1,), dtype=flat.dtype)])
+        packed = (flat[0::2] | (flat[1::2] << 4)).to(torch.uint8)
+        return packed.contiguous(), original_numel
+
+    @staticmethod
+    def _unpack_int4_tensor(packed: torch.Tensor, original_numel: int) -> torch.Tensor:
+        packed = packed.to(torch.uint8).flatten()
+        low = (packed & 0x0F).to(torch.int16)
+        high = ((packed >> 4) & 0x0F).to(torch.int16)
+        values = torch.empty((int(packed.numel()) * 2,), dtype=torch.int16)
+        values[0::2] = low
+        values[1::2] = high
+        values = values[:original_numel] - 8
+        return values.to(torch.int8)
+
+    @classmethod
+    def _quantize_tensor_to_cpu(cls, tensor: torch.Tensor, bits: int) -> dict:
+        source = tensor.detach().float().cpu()
+        qmax = 127 if bits == 8 else 7
+        max_abs = source.abs().max()
+        scale = max(float((max_abs / qmax).item()), 1e-8)
+        quantized = torch.round(source / scale).clamp(-qmax, qmax).to(torch.int8)
+        payload = {
+            "shape": tuple(int(dim) for dim in tensor.shape),
+            "scale": scale,
+            "bits": bits,
+        }
+        if bits == 4:
+            packed, original_numel = cls._pack_int4_tensor(quantized)
+            payload["packed"] = packed
+            payload["numel"] = original_numel
+        else:
+            payload["values"] = quantized.contiguous()
+        return payload
+
+    @classmethod
+    def _dequantize_tensor_from_cpu(
+        cls, payload: dict, *, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        bits = int(payload.get("bits", 8))
+        if bits == 4:
+            quantized = cls._unpack_int4_tensor(
+                payload["packed"], int(payload["numel"])
+            )
+        else:
+            quantized = payload["values"]
+        tensor = quantized.float().reshape(tuple(payload["shape"])) * float(
+            payload["scale"]
+        )
+        return tensor.to(device=device, dtype=dtype)
+
+    def _build_quantized_tail_store(
+        self,
+        *,
+        device_indices: torch.Tensor,
+        tail_start: int,
+        bits: int,
+        chunk_tokens: int,
+    ) -> Optional[dict]:
+        total_len = int(device_indices.numel())
+        tail_start = max(0, min(int(tail_start), total_len))
+        tail_len = total_len - tail_start
+        if tail_len <= 0:
+            return None
+
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        layers = []
+        for layer_id in self._graft_layer_ids():
+            layer_payload = {"layer_id": layer_id}
+            if self.kv_handle_registry.backend == "mla":
+                nope_chunks = []
+                rope_chunks = []
+                layer_stub = self._make_layer_stub(layer_id)
+                for rel_start in range(0, tail_len, chunk_tokens):
+                    rel_end = min(tail_len, rel_start + chunk_tokens)
+                    indices = device_indices[
+                        tail_start + rel_start : tail_start + rel_end
+                    ]
+                    k_nope, k_rope = kv_pool.get_mla_kv_buffer(layer_stub, indices)
+                    nope_chunks.append(
+                        {
+                            "start": rel_start,
+                            "end": rel_end,
+                            "tensor": self._quantize_tensor_to_cpu(k_nope, bits),
+                        }
+                    )
+                    rope_chunks.append(
+                        {
+                            "start": rel_start,
+                            "end": rel_end,
+                            "tensor": self._quantize_tensor_to_cpu(k_rope, bits),
+                        }
+                    )
+                layer_payload["k_nope"] = nope_chunks
+                layer_payload["k_rope"] = rope_chunks
+            else:
+                key_chunks = []
+                value_chunks = []
+                key_buffer = kv_pool.get_key_buffer(layer_id)
+                value_buffer = kv_pool.get_value_buffer(layer_id)
+                for rel_start in range(0, tail_len, chunk_tokens):
+                    rel_end = min(tail_len, rel_start + chunk_tokens)
+                    indices = device_indices[
+                        tail_start + rel_start : tail_start + rel_end
+                    ]
+                    key_chunks.append(
+                        {
+                            "start": rel_start,
+                            "end": rel_end,
+                            "tensor": self._quantize_tensor_to_cpu(
+                                key_buffer[indices], bits
+                            ),
+                        }
+                    )
+                    value_chunks.append(
+                        {
+                            "start": rel_start,
+                            "end": rel_end,
+                            "tensor": self._quantize_tensor_to_cpu(
+                                value_buffer[indices], bits
+                            ),
+                        }
+                    )
+                layer_payload["k"] = key_chunks
+                layer_payload["v"] = value_chunks
+            layers.append(layer_payload)
+
+        return {
+            "start": tail_start,
+            "length": tail_len,
+            "bits": bits,
+            "chunk_tokens": chunk_tokens,
+            "backend": self.kv_handle_registry.backend,
+            "layers": layers,
+        }
+
+    def _copy_quantized_tail_slice(
+        self,
+        *,
+        entry,
+        token_start: int,
+        token_end: int,
+        dst_indices: torch.Tensor,
+    ) -> None:
+        store = entry.quantized_tail
+        if not store:
+            raise ValueError("KV handle has no quantized tail payload")
+        tail_start = int(store["start"])
+        tail_end = tail_start + int(store["length"])
+        if token_start < tail_start:
+            prefix_end = min(token_end, tail_start)
+            if prefix_end > token_start:
+                src = entry.device_indices[token_start:prefix_end]
+                dst = dst_indices[: prefix_end - token_start]
+                self._copy_kv_indices(src, dst)
+        quant_start = max(token_start, tail_start)
+        quant_end = min(token_end, tail_end)
+        if quant_start >= quant_end:
+            return
+
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        dst_base = quant_start - token_start
+        rel_start = quant_start - tail_start
+        rel_end = quant_end - tail_start
+        for layer_payload in store["layers"]:
+            layer_id = int(layer_payload["layer_id"])
+            if store["backend"] == "mla":
+                layer_stub = self._make_layer_stub(layer_id)
+                for nope_chunk, rope_chunk in zip(
+                    layer_payload["k_nope"], layer_payload["k_rope"]
+                ):
+                    start = max(rel_start, int(nope_chunk["start"]))
+                    end = min(rel_end, int(nope_chunk["end"]))
+                    if start >= end:
+                        continue
+                    chunk_offset = start - int(nope_chunk["start"])
+                    dst_offset = dst_base + start - rel_start
+                    dst = dst_indices[dst_offset : dst_offset + (end - start)]
+                    k_nope = self._dequantize_tensor_from_cpu(
+                        nope_chunk["tensor"],
+                        device=dst.device,
+                        dtype=kv_pool.get_mla_kv_buffer(layer_stub, dst)[0].dtype,
+                    )[chunk_offset : chunk_offset + (end - start)]
+                    k_rope = self._dequantize_tensor_from_cpu(
+                        rope_chunk["tensor"],
+                        device=dst.device,
+                        dtype=kv_pool.get_mla_kv_buffer(layer_stub, dst)[1].dtype,
+                    )[chunk_offset : chunk_offset + (end - start)]
+                    kv_pool.set_mla_kv_buffer(layer_stub, dst, k_nope, k_rope)
+            else:
+                key_buffer = kv_pool.get_key_buffer(layer_id)
+                value_buffer = kv_pool.get_value_buffer(layer_id)
+                for key_chunk, value_chunk in zip(
+                    layer_payload["k"], layer_payload["v"]
+                ):
+                    start = max(rel_start, int(key_chunk["start"]))
+                    end = min(rel_end, int(key_chunk["end"]))
+                    if start >= end:
+                        continue
+                    chunk_offset = start - int(key_chunk["start"])
+                    dst_offset = dst_base + start - rel_start
+                    dst = dst_indices[dst_offset : dst_offset + (end - start)]
+                    key_buffer[dst] = self._dequantize_tensor_from_cpu(
+                        key_chunk["tensor"],
+                        device=dst.device,
+                        dtype=key_buffer.dtype,
+                    )[chunk_offset : chunk_offset + (end - start)]
+                    value_buffer[dst] = self._dequantize_tensor_from_cpu(
+                        value_chunk["tensor"],
+                        device=dst.device,
+                        dtype=value_buffer.dtype,
+                    )[chunk_offset : chunk_offset + (end - start)]
+
+    def _copy_kv_indices(self, source_indices: torch.Tensor, dst_indices: torch.Tensor) -> None:
+        if source_indices.numel() == 0:
+            return
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        if self.kv_handle_registry.backend == "mla":
+            for layer_id in self._graft_layer_ids():
+                layer_stub = self._make_layer_stub(layer_id)
+                k_nope, k_rope = kv_pool.get_mla_kv_buffer(layer_stub, source_indices)
+                kv_pool.set_mla_kv_buffer(
+                    layer_stub, dst_indices, k_nope.clone(), k_rope.clone()
+                )
+            return
+        for layer_id in self._graft_layer_ids():
+            kv_pool.get_key_buffer(layer_id)[dst_indices] = kv_pool.get_key_buffer(
+                layer_id
+            )[source_indices].clone()
+            kv_pool.get_value_buffer(layer_id)[dst_indices] = kv_pool.get_value_buffer(
+                layer_id
+            )[source_indices].clone()
+
+    @staticmethod
+    def _slice_overlaps_quantized_tail(entry, token_start: int, token_end: int) -> bool:
+        store = getattr(entry, "quantized_tail", None)
+        if not store:
+            return False
+        tail_start = int(store["start"])
+        tail_end = tail_start + int(store["length"])
+        return token_start < tail_end and token_end > tail_start
+
     def _maybe_compress_kv_export_payload(
         self,
         *,
@@ -498,12 +787,110 @@ class Scheduler(
         if compression is None:
             return KVExportPayload(device_indices, token_ids, origin_start)
 
-        if compression.profile != "old_sparse":
-            raise ValueError(
-                f"KV compression profile {compression.profile!r} is reserved but not implemented"
+        total_len = len(token_ids)
+        if compression.profile in {"quant_int8", "quant_int4"}:
+            if not self._kv_compression_triggered(total_len, compression):
+                return KVExportPayload(device_indices, token_ids, origin_start)
+            if not bool(getattr(compression, "quantize_tail", True)):
+                return KVExportPayload(device_indices, token_ids, origin_start)
+
+            spans = self._select_old_sparse_spans(total_len, compression)
+            kept_len = sum(end - start for start, end in spans)
+            if kept_len <= 0:
+                return KVExportPayload(device_indices, token_ids, origin_start)
+            if kept_len < total_len:
+                compressed_indices = device_indices[:kept_len]
+                self._copy_old_sparse_compressed_kv(
+                    source_indices=device_indices,
+                    dst_indices=compressed_indices,
+                    spans=spans,
+                    origin_start=origin_start,
+                )
+                working_indices = compressed_indices
+                working_token_ids = [
+                    token_id
+                    for start, end in spans
+                    for token_id in token_ids[start:end]
+                ]
+                working_origin_start = 0
+                original_tail_start = self._quantized_tail_start(total_len, compression)
+                tail_start = self._map_token_pos_to_compressed_offset(
+                    spans, original_tail_start
+                )
+            else:
+                working_indices = device_indices
+                working_token_ids = list(token_ids)
+                working_origin_start = origin_start
+                tail_start = self._quantized_tail_start(total_len, compression)
+
+            working_len = len(working_token_ids)
+            bits = 8 if compression.profile == "quant_int8" else 4
+            if tail_start <= 0 or tail_start >= working_len:
+                logger.info(
+                    "[kv_export compression] profile=%s original_tokens=%s compressed_tokens=%s spans=%s quantized_tail=none",
+                    compression.profile,
+                    total_len,
+                    working_len,
+                    spans,
+                )
+                return KVExportPayload(
+                    device_indices=working_indices,
+                    token_ids=working_token_ids,
+                    origin_start=working_origin_start,
+                    compressed=working_len < total_len,
+                    compression_type=compression.profile if working_len < total_len else None,
+                    original_token_count=total_len if working_len < total_len else None,
+                    compressed_token_count=working_len if working_len < total_len else None,
+                    compression_spans=spans if working_len < total_len else None,
+                )
+            quantized_tail = self._build_quantized_tail_store(
+                device_indices=working_indices,
+                tail_start=tail_start,
+                bits=bits,
+                chunk_tokens=max(1, int(compression.quant_chunk_tokens)),
+            )
+            if not quantized_tail:
+                return KVExportPayload(
+                    working_indices,
+                    working_token_ids,
+                    working_origin_start,
+                    compressed=working_len < total_len,
+                    compression_type=compression.profile if working_len < total_len else None,
+                    original_token_count=total_len if working_len < total_len else None,
+                    compressed_token_count=working_len if working_len < total_len else None,
+                    compression_spans=spans if working_len < total_len else None,
+                )
+            logger.info(
+                "[kv_export compression] profile=%s original_tokens=%s compressed_tokens=%s spans=%s quantized_tail=[%s,%s) bits=%s chunk_tokens=%s gpu_resident_tokens=%s",
+                compression.profile,
+                total_len,
+                working_len,
+                spans,
+                tail_start,
+                working_len,
+                bits,
+                int(compression.quant_chunk_tokens),
+                tail_start,
+            )
+            return KVExportPayload(
+                device_indices=working_indices[:tail_start],
+                token_ids=working_token_ids,
+                origin_start=working_origin_start,
+                compressed=True,
+                compression_type=compression.profile,
+                original_token_count=total_len,
+                compressed_token_count=working_len,
+                compression_spans=spans,
+                quantized_tail_start_token=tail_start,
+                quantization_bits=bits,
+                quantized_tail=quantized_tail,
             )
 
-        total_len = len(token_ids)
+        if compression.profile != "old_sparse":
+            raise ValueError(
+                f"KV compression profile {compression.profile!r} is not implemented"
+            )
+
         spans = self._select_old_sparse_spans(total_len, compression)
         kept_len = sum(end - start for start, end in spans)
         if kept_len <= 0 or kept_len >= total_len:
@@ -541,22 +928,18 @@ class Scheduler(
             compression_spans=spans,
         )
 
-    def _resolve_graft_segment(
-        self, req: Req, segment, current_prefix_indices: List[int], current_prefix_tokens: List[int]
+    def _resolve_graft_segment_eager(
+        self,
+        req: Req,
+        segment,
+        entry,
+        token_start: int,
+        token_end: int,
+        current_prefix_indices: List[int],
+        current_prefix_tokens: List[int],
     ) -> tuple[torch.Tensor, List[int], bool]:
-        entry = self.kv_handle_registry.lookup(segment.handle, tree_cache=self.tree_cache)
-        if entry.meta.model_key != self.kv_handle_registry.model_key:
-            raise ValueError(f"KV handle {segment.handle} belongs to another model")
-        if entry.meta.backend != self.kv_handle_registry.backend:
-            raise ValueError(f"KV handle {segment.handle} backend mismatch")
-
-        token_start = segment.token_start or 0
-        token_end = segment.token_end if segment.token_end is not None else len(entry.token_ids)
-        if token_start < 0 or token_end > len(entry.token_ids) or token_start >= token_end:
-            raise ValueError(f"Invalid graft slice for handle {segment.handle}")
-
-        slice_indices = entry.device_indices[token_start:token_end]
         slice_token_ids = entry.token_ids[token_start:token_end]
+        slice_indices = entry.device_indices[token_start:token_end]
         transform = segment.transform
         ref_params = (
             transform.rescale_params
@@ -636,13 +1019,16 @@ class Scheduler(
                 raise ValueError(
                     f"Invalid rescale reference slice for handle {reference_handle}"
                 )
-            ref_indices = ref_entry.device_indices[ref_token_start:ref_token_end]
+            ref_indices, ref_temp = self._materialize_reference_indices(
+                ref_entry, ref_token_start, ref_token_end
+            )
         else:
             ref_indices = (
                 torch.tensor(current_prefix_indices, dtype=torch.int64, device=slice_indices.device)
                 if current_prefix_indices
                 else None
             )
+            ref_temp = False
         entry_origin_start = int(
             getattr(entry.meta, "origin_start", segment.origin_start)
         )
@@ -668,16 +1054,234 @@ class Scheduler(
             getattr(transform, "rope_shift", None),
             getattr(transform, "rescale_profile", None),
         )
-        self.kv_graft_materializer.transform_segment(
-            source_indices=slice_indices,
-            dst_indices=new_indices,
-            transform=transform,
-            origin_start=source_origin_start,
-            current_prefix_len_before_append=len(current_prefix_tokens),
-            layer_ids=self._graft_layer_ids(),
-            reference_indices=ref_indices,
-        )
+        try:
+            self.kv_graft_materializer.transform_segment(
+                source_indices=slice_indices,
+                dst_indices=new_indices,
+                transform=transform,
+                origin_start=source_origin_start,
+                current_prefix_len_before_append=len(current_prefix_tokens),
+                layer_ids=self._graft_layer_ids(),
+                reference_indices=ref_indices,
+            )
+        finally:
+            if ref_temp and ref_indices is not None:
+                self.token_to_kv_pool_allocator.free(ref_indices)
         return new_indices, list(slice_token_ids), True
+
+    @staticmethod
+    def _transform_requires_materialization(transform) -> bool:
+        if transform is None:
+            return False
+        ref_params = (
+            transform.rescale_params
+            if getattr(transform, "rescale_params", None) is not None
+            else {}
+        )
+        if bool(ref_params.get("copy_only")) or bool(ref_params.get("alias_bypass")):
+            return False
+        k_amplify_token_count = int(ref_params.get("k_amplify_token_count", 0) or 0)
+        k_amplify_ratio = float(ref_params.get("k_amplify_ratio", 0) or 0)
+        k_amplify_mode = str(ref_params.get("k_amplify_mode", "fixed") or "fixed")
+        return bool(
+            transform.rope_shift not in (None, "off")
+            or transform.rescale_profile is not None
+            or (
+                k_amplify_token_count > 0
+                and (k_amplify_ratio > 0 or k_amplify_mode == "auto")
+            )
+        )
+
+    def _materialize_reference_indices(
+        self, entry, token_start: int, token_end: int
+    ) -> tuple[torch.Tensor, bool]:
+        if Scheduler._slice_overlaps_quantized_tail(entry, token_start, token_end):
+            ref_temp_indices = self._alloc_kv_indices_with_eviction(
+                token_end - token_start
+            )
+            self._copy_quantized_tail_slice(
+                entry=entry,
+                token_start=token_start,
+                token_end=token_end,
+                dst_indices=ref_temp_indices,
+            )
+            return ref_temp_indices, True
+        return entry.device_indices[token_start:token_end], False
+
+    def _append_lazy_quantized_graft_segment(
+        self,
+        req: Req,
+        *,
+        segment,
+        entry,
+        token_start: int,
+        token_end: int,
+        logical_start: int,
+    ) -> None:
+        transform = segment.transform
+        ref_params = (
+            transform.rescale_params
+            if transform is not None and getattr(transform, "rescale_params", None) is not None
+            else {}
+        )
+        entry_origin_start = int(
+            getattr(entry.meta, "origin_start", segment.origin_start)
+        )
+        segment_origin_start = int(segment.origin_start)
+        source_origin_start = max(
+            segment_origin_start, entry_origin_start + int(token_start)
+        )
+        descriptor = {
+            "handle": segment.handle,
+            "entry": entry,
+            "token_start": int(token_start),
+            "token_end": int(token_end),
+            "logical_start": int(logical_start),
+            "logical_end": int(logical_start + token_end - token_start),
+            "source_origin_start": int(source_origin_start),
+            "transform": transform,
+            "reference_handle": (
+                ref_params.get("reference_handle") if isinstance(ref_params, dict) else None
+            ),
+            "reference_token_start": int(
+                ref_params.get("reference_token_start", 0) or 0
+            )
+            if isinstance(ref_params, dict)
+            else 0,
+            "reference_token_end": (
+                int(ref_params["reference_token_end"])
+                if isinstance(ref_params, dict)
+                and ref_params.get("reference_token_end") is not None
+                else None
+            ),
+        }
+        if not hasattr(req, "lazy_quantized_graft_segments"):
+            req.lazy_quantized_graft_segments = []
+        req.lazy_quantized_graft_segments.append(descriptor)
+
+    def _resolve_graft_segment(
+        self, req: Req, segment, current_prefix_indices: List[int], current_prefix_tokens: List[int]
+    ) -> tuple[torch.Tensor, List[int], bool]:
+        entry = self.kv_handle_registry.lookup(segment.handle, tree_cache=self.tree_cache)
+        if entry.meta.model_key != self.kv_handle_registry.model_key:
+            raise ValueError(f"KV handle {segment.handle} belongs to another model")
+        if entry.meta.backend != self.kv_handle_registry.backend:
+            raise ValueError(f"KV handle {segment.handle} backend mismatch")
+
+        token_start = segment.token_start or 0
+        token_end = segment.token_end if segment.token_end is not None else len(entry.token_ids)
+        if token_start < 0 or token_end > len(entry.token_ids) or token_start >= token_end:
+            raise ValueError(f"Invalid graft slice for handle {segment.handle}")
+
+        if not Scheduler._slice_overlaps_quantized_tail(entry, token_start, token_end):
+            return Scheduler._resolve_graft_segment_eager(
+                self,
+                req,
+                segment,
+                entry,
+                token_start,
+                token_end,
+                current_prefix_indices,
+                current_prefix_tokens,
+            )
+
+        store = entry.quantized_tail
+        tail_start = int(store["start"])
+        tail_end = tail_start + int(store["length"])
+        resident_end = min(token_end, tail_start)
+        resident_indices = []
+        owned_indices = []
+        aliased_indices = []
+        if token_start < resident_end:
+            seg_indices, seg_tokens, is_owned = Scheduler._resolve_graft_segment_eager(
+                self,
+                req,
+                segment,
+                entry,
+                token_start,
+                resident_end,
+                current_prefix_indices,
+                current_prefix_tokens,
+            )
+            resident_indices.append(seg_indices)
+            if is_owned:
+                owned_indices.append(seg_indices)
+            else:
+                aliased_indices.append(seg_indices)
+
+        lazy_start = max(token_start, tail_start)
+        lazy_end = min(token_end, tail_end)
+        if lazy_start < lazy_end:
+            Scheduler._append_lazy_quantized_graft_segment(
+                self,
+                req,
+                segment=segment,
+                entry=entry,
+                token_start=lazy_start,
+                token_end=lazy_end,
+                logical_start=len(current_prefix_tokens) + (lazy_start - token_start),
+            )
+            logger.info(
+                "[kv_graft lazy_descriptor] rid=%s handle=%s token_range=[%s,%s) logical_range=[%s,%s) bits=%s",
+                req.rid,
+                segment.handle,
+                lazy_start,
+                lazy_end,
+                len(current_prefix_tokens) + (lazy_start - token_start),
+                len(current_prefix_tokens) + (lazy_end - token_start),
+                entry.meta.quantization_bits,
+            )
+
+        all_tokens = list(entry.token_ids[token_start:token_end])
+        if resident_indices:
+            if len(owned_indices) == len(resident_indices):
+                return torch.cat(resident_indices), all_tokens, True
+            if len(aliased_indices) == len(resident_indices):
+                return torch.cat(resident_indices), all_tokens, False
+            # Mixed ownership before the lazy tail is rare; track the pages as
+            # owned so cleanup is conservative for transformed chunks.
+            return torch.cat(resident_indices), all_tokens, True
+        device = entry.device_indices.device
+        return torch.empty((0,), dtype=torch.int64, device=device), all_tokens, True
+
+    def _estimate_kv_graft_materialization(
+        self, kv_graft
+    ) -> tuple[int, int, int]:
+        materialize_tokens = 0
+        quantized_tail_tokens = 0
+        gpu_resident_tokens = 0
+        if kv_graft is None:
+            return 0, 0, 0
+        for segment in kv_graft.segments:
+            entry = self.kv_handle_registry.lookup(
+                segment.handle, tree_cache=self.tree_cache
+            )
+            token_start = segment.token_start or 0
+            token_end = (
+                segment.token_end
+                if segment.token_end is not None
+                else len(entry.token_ids)
+            )
+            if (
+                token_start < 0
+                or token_end > len(entry.token_ids)
+                or token_start >= token_end
+            ):
+                raise ValueError(f"Invalid graft slice for handle {segment.handle}")
+            slice_len = token_end - token_start
+            materialize_tokens += min(
+                slice_len, int(getattr(entry.meta, "compressed_token_count", None) or slice_len)
+            )
+            store = getattr(entry, "quantized_tail", None)
+            if store:
+                tail_start = int(store["start"])
+                tail_end = tail_start + int(store["length"])
+                overlap = max(0, min(token_end, tail_end) - max(token_start, tail_start))
+            else:
+                overlap = 0
+            quantized_tail_tokens += overlap
+            gpu_resident_tokens += max(0, slice_len - overlap)
+        return materialize_tokens, quantized_tail_tokens, gpu_resident_tokens
 
     def _apply_kv_graft(self, req: Req, recv_req: TokenizedGenerateReqInput):
         req.kv_export_spec = recv_req.kv_export
@@ -688,13 +1292,23 @@ class Scheduler(
             )
             req.disable_radix_match = req.graft_export_after_prefill
             return
+        (
+            req.kv_graft_materialize_tokens,
+            req.kv_graft_quantized_tail_tokens,
+            req.kv_graft_gpu_resident_tokens,
+        ) = Scheduler._estimate_kv_graft_materialization(self, recv_req.kv_graft)
+        if not hasattr(req, "lazy_quantized_graft_segments"):
+            req.lazy_quantized_graft_segments = []
+        if not hasattr(req, "lazy_quantized_live_indices"):
+            req.lazy_quantized_live_indices = []
         synthetic_tokens: List[int] = []
         synthetic_indices: List[torch.Tensor] = []
         owned_indices: List[torch.Tensor] = []
         aliased_indices: List[torch.Tensor] = []
         synthetic_owned_masks: List[torch.Tensor] = []
         for segment in recv_req.kv_graft.segments:
-            seg_indices, seg_tokens, is_owned = self._resolve_graft_segment(
+            seg_indices, seg_tokens, is_owned = Scheduler._resolve_graft_segment(
+                self,
                 req, segment, [x for t in synthetic_indices for x in t.tolist()], synthetic_tokens
             )
             synthetic_tokens.extend(seg_tokens)
@@ -747,6 +1361,7 @@ class Scheduler(
             recv_req.kv_export is not None
             and recv_req.kv_export.materialize_graft_prefix
             and req.synthetic_prefix_indices.numel() > 0
+            and not req.lazy_quantized_graft_segments
             and any(segment.transform is not None for segment in recv_req.kv_graft.segments)
         ):
             spec = recv_req.kv_export
@@ -755,11 +1370,12 @@ class Scheduler(
                 for segment in recv_req.kv_graft.segments
                 if segment.transform is not None
             ]
-            payload = self._maybe_compress_kv_export_payload(
+            payload = Scheduler._maybe_compress_kv_export_payload(
+                self,
                 device_indices=req.synthetic_prefix_indices,
                 token_ids=req.synthetic_prefix_token_ids,
                 origin_start=0,
-                compression=spec.compression,
+                compression=getattr(spec, "compression", None),
             )
             meta = self.kv_handle_registry.register(
                 allocator=self.token_to_kv_pool_allocator,
@@ -780,6 +1396,9 @@ class Scheduler(
                 original_token_count=payload.original_token_count,
                 compressed_token_count=payload.compressed_token_count,
                 compression_spans=payload.compression_spans,
+                quantized_tail_start_token=payload.quantized_tail_start_token,
+                quantization_bits=payload.quantization_bits,
+                quantized_tail=payload.quantized_tail,
                 handle=Scheduler._kv_export_handle(
                     self, req, len(req.kv_exports or [])
                 ),
@@ -792,6 +1411,101 @@ class Scheduler(
                 meta.token_count,
                 len(transform_provenance),
             )
+
+    def _materialize_lazy_quantized_graft_for_extend(self, req: Req) -> None:
+        descriptors = getattr(req, "lazy_quantized_graft_segments", None)
+        if not descriptors or req.extend_input_len <= 1:
+            return
+
+        prefix_len = len(req.prefix_indices)
+        chunk_end = prefix_len + req.extend_input_len
+        materialize_limit = prefix_len + req.extend_input_len - 1
+        new_indices: List[torch.Tensor] = []
+        materialized_tokens = 0
+
+        for descriptor in sorted(descriptors, key=lambda item: item["logical_start"]):
+            logical_start = int(descriptor["logical_start"])
+            logical_end = int(descriptor["logical_end"])
+            start = max(prefix_len + materialized_tokens, logical_start)
+            end = min(chunk_end, materialize_limit, logical_end)
+            if start >= end:
+                continue
+            if start != prefix_len + materialized_tokens:
+                break
+
+            rel_start = start - logical_start
+            rel_end = end - logical_start
+            token_start = int(descriptor["token_start"]) + rel_start
+            token_end = int(descriptor["token_start"]) + rel_end
+            dst_indices = self._alloc_kv_indices_with_eviction(token_end - token_start)
+            self._copy_quantized_tail_slice(
+                entry=descriptor["entry"],
+                token_start=token_start,
+                token_end=token_end,
+                dst_indices=dst_indices,
+            )
+
+            transform = descriptor.get("transform")
+            if Scheduler._transform_requires_materialization(transform):
+                ref_indices = None
+                ref_temp = False
+                reference_handle = descriptor.get("reference_handle")
+                if reference_handle:
+                    ref_entry = self.kv_handle_registry.lookup(
+                        reference_handle, tree_cache=self.tree_cache
+                    )
+                    ref_token_start = int(descriptor.get("reference_token_start", 0) or 0)
+                    ref_token_end = descriptor.get("reference_token_end")
+                    ref_token_end = (
+                        int(ref_token_end)
+                        if ref_token_end is not None
+                        else len(ref_entry.token_ids)
+                    )
+                    ref_indices, ref_temp = self._materialize_reference_indices(
+                        ref_entry, ref_token_start, ref_token_end
+                    )
+                elif req.prefix_indices.numel() > 0:
+                    ref_indices = req.prefix_indices
+                try:
+                    self.kv_graft_materializer.transform_segment(
+                        source_indices=dst_indices,
+                        dst_indices=dst_indices,
+                        transform=transform,
+                        origin_start=int(descriptor["source_origin_start"]) + rel_start,
+                        current_prefix_len_before_append=start,
+                        layer_ids=self._graft_layer_ids(),
+                        reference_indices=ref_indices,
+                    )
+                finally:
+                    if ref_temp and ref_indices is not None:
+                        self.token_to_kv_pool_allocator.free(ref_indices)
+
+            new_indices.append(dst_indices)
+            req.lazy_quantized_live_indices.append(dst_indices)
+            materialized_tokens += token_end - token_start
+
+        if materialized_tokens <= 0:
+            return
+
+        materialized = torch.cat(new_indices)
+        req.prefix_indices = (
+            torch.cat([req.prefix_indices, materialized])
+            if req.prefix_indices.numel() > 0
+            else materialized
+        )
+        req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+        req.cache_protected_len = min(
+            len(req.synthetic_prefix_token_ids), len(req.prefix_indices)
+        )
+        req.kv_graft_gpu_resident_tokens += materialized_tokens
+        logger.info(
+            "[kv_graft lazy_materialize] rid=%s range=[%s,%s) tokens=%s live_tokens=%s",
+            req.rid,
+            prefix_len,
+            prefix_len + materialized_tokens,
+            materialized_tokens,
+            sum(int(t.numel()) for t in req.lazy_quantized_live_indices),
+        )
 
     def _maybe_register_kv_export(
         self, req: Req, *, committed_len_override: Optional[int] = None
@@ -821,7 +1535,14 @@ class Scheduler(
         if spec.token_start is not None:
             token_start = spec.token_start
         else:
-            token_start = req.synthetic_prefix_physical_len
+            synthetic_prefix_token_ids = getattr(req, "synthetic_prefix_token_ids", [])
+            token_start = (
+                len(synthetic_prefix_token_ids)
+                if synthetic_prefix_token_ids
+                else req.synthetic_prefix_physical_len
+                if req.kv_graft_spec is not None
+                else req.synthetic_prefix_physical_len
+            )
         token_end = (
             spec.token_end
             if spec.token_end is not None
@@ -836,9 +1557,15 @@ class Scheduler(
         ].to(torch.int64)
         if device_indices.numel() == 0:
             return
+        synthetic_prefix_token_ids = getattr(req, "synthetic_prefix_token_ids", [])
+        synthetic_prefix_len = (
+            len(synthetic_prefix_token_ids)
+            if synthetic_prefix_token_ids
+            else req.synthetic_prefix_physical_len
+        )
         composite = bool(
-            req.synthetic_prefix_physical_len
-            and token_start < req.synthetic_prefix_physical_len
+            synthetic_prefix_len
+            and token_start < synthetic_prefix_len
         )
         # When origin_start is the default (0) infer from token_start so
         # rope_shift uses correct source positions for grafted KV pages.
@@ -868,11 +1595,12 @@ class Scheduler(
             and token_start == 0
             and req.kv_graft_spec is not None
         )
-        payload = self._maybe_compress_kv_export_payload(
+        payload = Scheduler._maybe_compress_kv_export_payload(
+            self,
             device_indices=device_indices,
             token_ids=token_ids,
             origin_start=origin_start,
-            compression=spec.compression if materialized else None,
+            compression=getattr(spec, "compression", None) if materialized else None,
         )
         meta = self.kv_handle_registry.register(
             allocator=self.token_to_kv_pool_allocator,
@@ -897,6 +1625,9 @@ class Scheduler(
             original_token_count=payload.original_token_count,
             compressed_token_count=payload.compressed_token_count,
             compression_spans=payload.compression_spans,
+            quantized_tail_start_token=payload.quantized_tail_start_token,
+            quantization_bits=payload.quantization_bits,
+            quantized_tail=payload.quantized_tail,
             handle=Scheduler._kv_export_handle(self, req, len(existing_exports)),
         )
         req.kv_exports = existing_exports + [meta]
@@ -3018,6 +3749,12 @@ class Scheduler(
             max_prefill_bs=self.max_prefill_bs,
             max_running_requests=self.max_running_requests,
             prefill_max_requests=self.server_args.prefill_max_requests,
+            kv_graft_max_prefill_materialize_tokens=(
+                self.server_args.kv_graft_max_prefill_materialize_tokens
+            ),
+            kv_graft_max_running_materialize_tokens=(
+                self.server_args.kv_graft_max_running_materialize_tokens
+            ),
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
         )
@@ -3144,6 +3881,9 @@ class Scheduler(
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
             )
+
+        for req in can_run_list:
+            self._materialize_lazy_quantized_graft_for_extend(req)
 
         new_batch.prepare_for_extend()
 

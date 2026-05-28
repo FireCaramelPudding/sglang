@@ -263,6 +263,24 @@ def test_old_sparse_span_selection_uses_round_boundaries():
     assert sum(end - start for start, end in spans) <= 8
 
 
+def test_old_sparse_span_selection_caps_large_protected_tail():
+    spec = KVCompressionSpec(
+        profile="old_sparse",
+        compress_after_rounds=2,
+        current_round=5,
+        max_tokens=8,
+        protected_prefix_tokens=3,
+        protected_tail_start_token=10,
+        anchor_spans=2,
+    )
+
+    spans = Scheduler._select_old_sparse_spans(32, spec)
+
+    assert spans[0] == (0, 3)
+    assert spans[-1] == (27, 32)
+    assert sum(end - start for start, end in spans) <= 8
+
+
 def test_old_sparse_span_selection_skips_until_round_threshold():
     spec = KVCompressionSpec(
         profile="old_sparse",
@@ -277,19 +295,248 @@ def test_old_sparse_span_selection_skips_until_round_threshold():
     assert Scheduler._select_old_sparse_spans(32, spec) == [(0, 32)]
 
 
-def test_quantized_kv_compression_profiles_are_explicitly_reserved():
+def test_quantized_kv_compression_profile_quantizes_tail_payload():
     scheduler = object.__new__(Scheduler)
-    spec = KVCompressionSpec(profile="quant_int8")
+    kv_pool = _FakeKVPool()
+    kv_pool.key_buffers[0][2] = torch.tensor([[7.0, -3.0, 2.0, -1.0]])
+    kv_pool.key_buffers[0][3] = torch.tensor([[4.0, -6.0, 1.0, -2.0]])
+    kv_pool.value_buffers[0][2] = torch.tensor([[5.0, -2.0, 3.0, -1.0]])
+    kv_pool.value_buffers[0][3] = torch.tensor([[8.0, -4.0, 2.0, -3.0]])
+    scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+        get_kvcache=lambda: kv_pool
+    )
+    scheduler.kv_handle_registry = SimpleNamespace(backend="mha")
+    scheduler._graft_layer_ids = lambda: [0]
+    spec = KVCompressionSpec(
+        profile="quant_int8",
+        compress_after_rounds=1,
+        current_round=2,
+        protected_tail_start_token=2,
+        quant_chunk_tokens=1,
+    )
 
-    with unittest.TestCase().assertRaisesRegex(
-        ValueError, "reserved but not implemented"
-    ):
-        scheduler._maybe_compress_kv_export_payload(
-            device_indices=torch.tensor([1, 2], dtype=torch.int64),
-            token_ids=[10, 11],
+    payload = scheduler._maybe_compress_kv_export_payload(
+        device_indices=torch.tensor([0, 1, 2, 3], dtype=torch.int64),
+        token_ids=[10, 11, 12, 13],
+        origin_start=0,
+        compression=spec,
+    )
+
+    assert payload.compressed is True
+    assert payload.compression_type == "quant_int8"
+    assert payload.device_indices.tolist() == [0, 1]
+    assert payload.token_ids == [10, 11, 12, 13]
+    assert payload.quantized_tail_start_token == 2
+    assert payload.quantization_bits == 8
+    assert payload.quantized_tail["length"] == 2
+
+    entry = SimpleNamespace(
+        quantized_tail=payload.quantized_tail,
+        device_indices=torch.tensor([0, 1], dtype=torch.int64),
+    )
+    scheduler._copy_quantized_tail_slice(
+        entry=entry,
+        token_start=2,
+        token_end=4,
+        dst_indices=torch.tensor([0, 1], dtype=torch.int64),
+    )
+
+    assert torch.allclose(
+        kv_pool.key_buffers[0][0:2],
+        torch.tensor(
+            [
+                [[7.0, -3.0, 2.0, -1.0]],
+                [[4.0, -6.0, 1.0, -2.0]],
+            ]
+        ),
+        atol=0.08,
+    )
+    assert torch.allclose(
+        kv_pool.value_buffers[0][0:2],
+        torch.tensor(
+            [
+                [[5.0, -2.0, 3.0, -1.0]],
+                [[8.0, -4.0, 2.0, -3.0]],
+            ]
+        ),
+        atol=0.08,
+    )
+
+
+def test_quantized_kv_compression_prunes_before_quantizing_tail_payload():
+    scheduler = object.__new__(Scheduler)
+    kv_pool = _FakeKVPool()
+    kv_pool.key_buffers[0] = torch.arange(32, dtype=torch.float32).reshape(8, 1, 4)
+    kv_pool.value_buffers[0] = (
+        torch.arange(100, 132, dtype=torch.float32).reshape(8, 1, 4)
+    )
+    scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+        get_kvcache=lambda: kv_pool
+    )
+    scheduler.kv_handle_registry = SimpleNamespace(backend="mha")
+    scheduler.kv_graft_materializer = SimpleNamespace(
+        _rope_shift_tensor=lambda tensor, delta, origin_start=0: tensor
+    )
+    scheduler._graft_layer_ids = lambda: [0]
+    spec = KVCompressionSpec(
+        profile="quant_int8",
+        compress_after_tokens=2,
+        max_tokens=4,
+        protected_prefix_tokens=1,
+        protected_tail_start_token=6,
+        anchor_spans=1,
+        quant_chunk_tokens=1,
+    )
+
+    payload = scheduler._maybe_compress_kv_export_payload(
+        device_indices=torch.arange(8, dtype=torch.int64),
+        token_ids=list(range(8)),
+        origin_start=0,
+        compression=spec,
+    )
+
+    assert payload.compressed is True
+    assert payload.compression_type == "quant_int8"
+    assert payload.original_token_count == 8
+    assert payload.compressed_token_count == 4
+    assert payload.token_ids == [0, 3, 6, 7]
+    assert payload.device_indices.tolist() == [0, 1]
+    assert payload.compression_spans == [(0, 1), (3, 4), (6, 8)]
+    assert payload.quantized_tail_start_token == 2
+    assert payload.quantized_tail["length"] == 2
+
+    assert torch.equal(kv_pool.key_buffers[0][0], torch.tensor([[0.0, 1.0, 2.0, 3.0]]))
+    assert torch.equal(
+        kv_pool.key_buffers[0][1], torch.tensor([[12.0, 13.0, 14.0, 15.0]])
+    )
+
+
+def test_resolve_quantized_tail_records_lazy_descriptor_without_full_alloc():
+    entry = SimpleNamespace(
+        meta=SimpleNamespace(
+            model_key="model",
+            backend="mha",
             origin_start=0,
-            compression=spec,
-        )
+            quantization_bits=8,
+            compressed_token_count=4,
+        ),
+        device_indices=torch.tensor([10, 11], dtype=torch.int64),
+        token_ids=[100, 101, 102, 103],
+        quantized_tail={"start": 2, "length": 2, "bits": 8},
+    )
+    allocator = _AllocRecorder()
+    registry = _LookupRegistry(entry)
+    fake_scheduler = SimpleNamespace(
+        kv_handle_registry=registry,
+        tree_cache=SimpleNamespace(),
+        token_to_kv_pool_allocator=allocator,
+    )
+    req = SimpleNamespace(
+        rid="req_lazy",
+        lazy_quantized_graft_segments=[],
+    )
+    segment = SimpleNamespace(
+        handle="kvh_quant",
+        token_start=None,
+        token_end=None,
+        origin_start=0,
+        transform=None,
+    )
+
+    indices, tokens, is_owned = Scheduler._resolve_graft_segment(
+        fake_scheduler, req, segment, [], []
+    )
+
+    assert indices.tolist() == [10, 11]
+    assert tokens == [100, 101, 102, 103]
+    assert is_owned is False
+    assert [held.tolist() for held in allocator.held] == [[10, 11]]
+    assert len(req.lazy_quantized_graft_segments) == 1
+    descriptor = req.lazy_quantized_graft_segments[0]
+    assert descriptor["token_start"] == 2
+    assert descriptor["token_end"] == 4
+    assert descriptor["logical_start"] == 2
+    assert descriptor["logical_end"] == 4
+
+
+def test_lazy_quantized_materialize_allocates_current_chunk_only():
+    scheduler = object.__new__(Scheduler)
+    kv_pool = _FakeKVPool()
+    kv_pool.key_buffers[0][2] = torch.tensor([[7.0, -3.0, 2.0, -1.0]])
+    kv_pool.key_buffers[0][3] = torch.tensor([[4.0, -6.0, 1.0, -2.0]])
+    kv_pool.value_buffers[0][2] = torch.tensor([[5.0, -2.0, 3.0, -1.0]])
+    kv_pool.value_buffers[0][3] = torch.tensor([[8.0, -4.0, 2.0, -3.0]])
+    scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+        get_kvcache=lambda: kv_pool
+    )
+    scheduler.kv_handle_registry = SimpleNamespace(backend="mha")
+    scheduler._graft_layer_ids = lambda: [0]
+    payload = scheduler._maybe_compress_kv_export_payload(
+        device_indices=torch.tensor([0, 1, 2, 3], dtype=torch.int64),
+        token_ids=[10, 11, 12, 13],
+        origin_start=0,
+        compression=KVCompressionSpec(
+            profile="quant_int8",
+            compress_after_rounds=1,
+            current_round=2,
+            protected_tail_start_token=2,
+            quant_chunk_tokens=1,
+        ),
+    )
+    entry = SimpleNamespace(
+        meta=SimpleNamespace(quantization_bits=8),
+        device_indices=torch.tensor([0, 1], dtype=torch.int64),
+        token_ids=[10, 11, 12, 13],
+        quantized_tail=payload.quantized_tail,
+    )
+    allocated = []
+
+    def _alloc(num_tokens):
+        allocated.append(num_tokens)
+        return torch.tensor([0, 1], dtype=torch.int64)
+
+    scheduler._alloc_kv_indices_with_eviction = _alloc
+    req = SimpleNamespace(
+        rid="req_lazy_chunk",
+        prefix_indices=torch.tensor([20, 21], dtype=torch.int64),
+        extend_input_len=3,
+        fill_ids=[10, 11, 12, 13, 99],
+        synthetic_prefix_token_ids=[10, 11, 12, 13],
+        cache_protected_len=2,
+        kv_graft_gpu_resident_tokens=2,
+        graft_owned_indices=torch.empty((0,), dtype=torch.int64),
+        lazy_quantized_live_indices=[],
+        lazy_quantized_graft_segments=[
+            {
+                "entry": entry,
+                "token_start": 2,
+                "token_end": 4,
+                "logical_start": 2,
+                "logical_end": 4,
+                "source_origin_start": 2,
+                "transform": None,
+                "reference_handle": None,
+            }
+        ],
+    )
+    req.set_extend_input_len = lambda value: setattr(req, "extend_input_len", value)
+
+    Scheduler._materialize_lazy_quantized_graft_for_extend(scheduler, req)
+
+    assert allocated == [2]
+    assert req.prefix_indices.tolist() == [20, 21, 0, 1]
+    assert req.extend_input_len == 1
+    assert sum(t.numel() for t in req.lazy_quantized_live_indices) == 2
+    assert torch.allclose(
+        kv_pool.key_buffers[0][0:2],
+        torch.tensor(
+            [
+                [[7.0, -3.0, 2.0, -1.0]],
+                [[4.0, -6.0, 1.0, -2.0]],
+            ]
+        ),
+        atol=0.08,
+    )
 
 
 def test_old_sparse_compression_compacts_into_existing_export_indices():
