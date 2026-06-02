@@ -946,6 +946,23 @@ class Scheduler(
 
         setattr(req, "text_kv_control_applied", True)
         setattr(req, "text_kv_control_recompute_first_token", bool(spec.recompute_first_token))
+        if bool(spec.recompute_first_token) and compact_token_ids:
+            pending_token = compact_token_ids[-1]
+            pending_indices = working_indices[-1:].to(torch.int64)
+            if pending_indices.numel() > 0:
+                self.token_to_kv_pool_allocator.free(pending_indices)
+            req.origin_input_ids = compact_token_ids[:-1]
+            req.origin_input_ids_len = len(req.origin_input_ids)
+            req.kv_committed_len = min(req.kv_committed_len, len(req.origin_input_ids))
+            req.kv_allocated_len = min(req.kv_allocated_len, len(req.origin_input_ids))
+            setattr(req, "text_kv_control_pending_prompt_token", pending_token)
+            logger.info(
+                "[text_kv_control recompute_first_token] rid=%s pending_prompt_token=%s prompt_tokens=%s released_stale_kv=%s",
+                req.rid,
+                pending_token,
+                len(req.origin_input_ids),
+                int(pending_indices.numel()),
+            )
         logger.info(
             "[text_kv_control] original_tokens=%s compressed_tokens=%s spans=%s k_amplify=%s quant_roundtrip=%s recompute_first_token=%s",
             total_len,

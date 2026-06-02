@@ -24,8 +24,11 @@ from sglang.srt.managers.kv_graft_materializer import (
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import CacheAwarePolicy, SchedulePolicy
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_output_processor_mixin import (
+    SchedulerOutputProcessorMixin,
+)
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
-from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.common import alloc_token_slots, release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -226,6 +229,103 @@ class _ReleaseCommunicatorRecorder:
     async def __call__(self, recv_req):
         self.seen_handles = list(recv_req.handles)
         return self.results
+
+
+class _RetryAllocAllocator:
+    def __init__(self):
+        self.available = 0
+        self.alloc_calls = 0
+        self.evict_calls = []
+
+    def available_size(self):
+        return self.available
+
+    def backup_state(self):
+        return (self.available,)
+
+    def alloc(self, num_tokens):
+        self.alloc_calls += 1
+        if self.available < num_tokens:
+            return None
+        self.available -= num_tokens
+        return torch.arange(num_tokens, dtype=torch.int64)
+
+
+class _RetryAllocTreeCache:
+    def __init__(self):
+        self.token_to_kv_pool_allocator = _RetryAllocAllocator()
+        self.pretty_print_called = False
+
+    def is_chunk_cache(self):
+        return False
+
+    def evict(self, params):
+        self.token_to_kv_pool_allocator.evict_calls.append(params.num_tokens)
+        # First eviction still leaves the free list slightly short of one chunk;
+        # the retry should bridge that gap instead of raising OOM.
+        added = 3991 if len(self.token_to_kv_pool_allocator.evict_calls) == 1 else 105
+        self.token_to_kv_pool_allocator.available += added
+        return SimpleNamespace(num_tokens_evicted=added)
+
+    def available_and_evictable_str(self):
+        return "available_size=3991 + evictable_size=1453372"
+
+    def pretty_print(self):
+        self.pretty_print_called = True
+
+
+class _NoProgressRetryTreeCache:
+    def __init__(self):
+        self.token_to_kv_pool_allocator = _RetryAllocAllocator()
+        self.token_to_kv_pool_allocator.available = 0
+        self.pretty_print_called = False
+
+    def is_chunk_cache(self):
+        return False
+
+    def evict(self, params):
+        calls = self.token_to_kv_pool_allocator.evict_calls
+        calls.append(params.num_tokens)
+        # Simulate pages that are evicted from radix cache but remain externally
+        # held by exported KV handles, so allocator availability does not move.
+        if len(calls) < 4:
+            return SimpleNamespace(num_tokens_evicted=params.num_tokens)
+        self.token_to_kv_pool_allocator.available += 4096
+        return SimpleNamespace(num_tokens_evicted=4096)
+
+    def available_and_evictable_str(self):
+        return "available_size=0 + evictable_size=1048576"
+
+    def pretty_print(self):
+        self.pretty_print_called = True
+
+
+def test_alloc_token_slots_retries_after_partial_eviction():
+    tree_cache = _RetryAllocTreeCache()
+
+    out, state = alloc_token_slots(tree_cache, 4096, backup_state=True)
+
+    assert out.numel() == 4096
+    assert state == (4096,)
+    assert tree_cache.token_to_kv_pool_allocator.evict_calls == [4096, 4096]
+    assert tree_cache.token_to_kv_pool_allocator.alloc_calls == 2
+    assert tree_cache.pretty_print_called is False
+
+
+def test_alloc_token_slots_keeps_retrying_when_eviction_is_externally_held():
+    tree_cache = _NoProgressRetryTreeCache()
+
+    out = alloc_token_slots(tree_cache, 4096)
+
+    assert out.numel() == 4096
+    assert tree_cache.token_to_kv_pool_allocator.evict_calls == [
+        4096,
+        4096,
+        8192,
+        16384,
+    ]
+    assert tree_cache.token_to_kv_pool_allocator.alloc_calls == 4
+    assert tree_cache.pretty_print_called is False
 
 
 def test_kv_compression_spec_parses_old_sparse_dict():
@@ -481,6 +581,8 @@ def test_text_kv_control_k_amplify_only_changes_keys():
     assert torch.equal(kv_pool.key_buffers[0][1], torch.full((1, 4), 4.0))
     assert torch.equal(kv_pool.value_buffers[0], original_values)
     assert req.text_kv_control_recompute_first_token is True
+    assert req.origin_input_ids == [10, 11, 12]
+    assert req.text_kv_control_pending_prompt_token == 13
 
 
 def test_text_kv_control_compacts_tokens_and_maps_quant_tail():
@@ -506,12 +608,131 @@ def test_text_kv_control_compacts_tokens_and_maps_quant_tail():
     applied = Scheduler._maybe_apply_text_kv_control_after_prefill(scheduler, req)
 
     assert applied is True
-    assert req.origin_input_ids == [10, 13]
-    assert req.kv_committed_len == 2
+    assert req.origin_input_ids == [10]
+    assert req.text_kv_control_pending_prompt_token == 13
+    assert req.kv_committed_len == 1
     assert torch.equal(req_to_token[0, :2], torch.tensor([0, 1]))
     assert allocator.freed and torch.equal(allocator.freed[0], torch.tensor([2, 3]))
     assert seen["tail_start"] == 1
     assert seen["bits"] == 8
+
+
+def test_prefill_text_kv_control_runs_before_export():
+    scheduler = object.__new__(SchedulerOutputProcessorMixin)
+    scheduler.is_generation = True
+    scheduler.enable_hisparse = False
+    scheduler.stream_output = lambda *args, **kwargs: None
+    scheduler.report_prefill_stats = lambda *args, **kwargs: None
+    scheduler.maybe_collect_routed_experts = lambda req: None
+    scheduler.maybe_collect_customized_info = lambda i, req, logits_output: None
+    scheduler.tree_cache = SimpleNamespace(cache_unfinished_req=lambda req: None)
+
+    order = []
+
+    def _apply(req):
+        order.append("apply")
+        req.origin_input_ids = [10, 11]
+        req.origin_input_ids_len = 2
+        req.text_kv_control_pending_prompt_token = 12
+        return True
+
+    def _export(req):
+        order.append(("export", len(req.origin_input_ids)))
+
+    scheduler._maybe_apply_text_kv_control_after_prefill = _apply
+    scheduler._maybe_register_prefill_graft_export = _export
+
+    req = _TextControlReq([10, 11, 12])
+    req.output_ids = []
+    req.is_retracted = False
+    req.is_chunked = 0
+    req.return_logprob = False
+    req.return_hidden_states = False
+    req.grammar = None
+    req.finished = lambda: False
+    req.time_stats = SimpleNamespace(set_prefill_finished_time=lambda: None)
+
+    batch = SimpleNamespace(
+        reqs=[req],
+        return_logprob=False,
+        decoding_reqs=None,
+        output_ids=torch.tensor([99], dtype=torch.int64),
+        seq_lens=torch.tensor([3], dtype=torch.int64),
+        seq_lens_cpu=torch.tensor([3], dtype=torch.int64),
+        orig_seq_lens=torch.tensor([3], dtype=torch.int64),
+        prefill_stats=None,
+        dp_cooperation_info=None,
+    )
+    result = SimpleNamespace(
+        copy_done=None,
+        logits_output=None,
+        next_token_ids=torch.tensor([99], dtype=torch.int64),
+        extend_input_len_per_req=None,
+        extend_logprob_start_len_per_req=None,
+        can_run_cuda_graph=False,
+    )
+
+    SchedulerOutputProcessorMixin.process_batch_result_prefill(scheduler, batch, result)
+
+    assert order == ["apply", ("export", 2)]
+    assert req.output_ids == []
+    assert batch.output_ids.tolist() == [12]
+    assert batch.seq_lens.tolist() == [2]
+
+
+def test_text_kv_control_decode_restores_pending_prompt_before_output():
+    scheduler = object.__new__(SchedulerOutputProcessorMixin)
+    scheduler.enable_overlap = False
+    scheduler.enable_metrics = False
+    scheduler.server_args = SimpleNamespace(
+        disaggregation_decode_enable_offload_kvcache=False
+    )
+    scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+        free_group_begin=lambda: None,
+        free_group_end=lambda: None,
+    )
+    scheduler.maybe_collect_routed_experts = lambda req: None
+    scheduler.maybe_collect_customized_info = lambda i, req, logits_output: None
+    scheduler._mamba_prefix_cache_update = lambda req, batch, result, i: None
+    scheduler.stream_output = lambda reqs, return_logprob: None
+    scheduler.report_decode_stats = lambda *args, **kwargs: None
+    scheduler.forward_ct_decode = 0
+    scheduler.num_generated_tokens = 0
+
+    req = _TextControlReq([10])
+    req.output_ids = []
+    req.is_retracted = False
+    req.decode_batch_idx = 0
+    req.return_logprob = False
+    req.return_hidden_states = False
+    req.grammar = None
+    req.multimodal_inputs = None
+    req.session = None
+    req.finished = lambda: False
+    req.check_finished = lambda new_accepted_len=1: None
+    req.time_stats = SimpleNamespace(set_last_decode_finish_time=lambda: None)
+    req.text_kv_control_pending_prompt_token = 13
+
+    batch = SimpleNamespace(
+        reqs=[req],
+        spec_algorithm=SimpleNamespace(is_none=lambda: True),
+        is_spec_v2=False,
+        return_logprob=False,
+        batch_size=lambda: 1,
+    )
+    result = SimpleNamespace(
+        copy_done=None,
+        logits_output=None,
+        next_token_ids=torch.tensor([99], dtype=torch.int64),
+        can_run_cuda_graph=False,
+        num_accepted_tokens=1,
+    )
+
+    SchedulerOutputProcessorMixin.process_batch_result_decode(scheduler, batch, result)
+
+    assert req.origin_input_ids == [10, 13]
+    assert req.output_ids == [99]
+    assert req.text_kv_control_pending_prompt_token is None
 
 
 def test_resolve_quantized_tail_records_lazy_descriptor_without_full_alloc():

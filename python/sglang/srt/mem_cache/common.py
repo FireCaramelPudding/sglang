@@ -211,6 +211,48 @@ def alloc_token_slots(
         state = allocator.backup_state()
 
     out_cache_loc = allocator.alloc(num_tokens)
+    if (
+        out_cache_loc is None
+        and tree_cache is not None
+        and not tree_cache.is_chunk_cache()
+    ):
+        # Evict until the allocator actually has enough free slots. HiCache/KV
+        # export handles can keep evicted pages externally held, so one radix
+        # eviction can report progress without increasing allocator availability.
+        retry = 0
+        no_progress_retries = 0
+        max_retries = 12
+        while retry < max_retries:
+            retry += 1
+            available_before = allocator.available_size()
+            deficit = max(0, num_tokens - available_before)
+            evict_tokens = max(num_tokens, deficit) * (2**no_progress_retries)
+            num_evicted = evict_from_tree_cache(tree_cache, evict_tokens)
+            available_after_evict = allocator.available_size()
+            logger.warning(
+                "KV allocation retry %s after eviction shortfall: need=%s, "
+                "available=%s, deficit=%s, evict_tokens=%s, evicted=%s, "
+                "available_after_evict=%s",
+                retry,
+                num_tokens,
+                available_before,
+                deficit,
+                evict_tokens,
+                num_evicted,
+                available_after_evict,
+            )
+            if backup_state:
+                state = allocator.backup_state()
+            out_cache_loc = allocator.alloc(num_tokens)
+            if out_cache_loc is not None:
+                break
+            available_after_alloc = allocator.available_size()
+            if num_evicted <= 0 and available_after_alloc <= available_before:
+                break
+            if available_after_evict <= available_before:
+                no_progress_retries = min(no_progress_retries + 1, 6)
+            else:
+                no_progress_retries = 0
 
     if out_cache_loc is None:
         error_msg = (
@@ -226,12 +268,12 @@ def alloc_token_slots(
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
 
-def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
+def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int) -> int:
     if tree_cache is None:
-        return
+        return 0
 
     if tree_cache.is_chunk_cache():
-        return
+        return 0
 
     allocator = tree_cache.token_to_kv_pool_allocator
 
@@ -243,13 +285,16 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         if full_available_size < num_tokens or swa_available_size < num_tokens:
             full_num_tokens = max(0, num_tokens - full_available_size)
             swa_num_tokens = max(0, num_tokens - swa_available_size)
-            tree_cache.evict(
+            result = tree_cache.evict(
                 EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
             )
+            return int(getattr(result, "num_tokens_evicted", 0))
     else:
         # Standard allocator
         if allocator.available_size() < num_tokens:
-            tree_cache.evict(EvictParams(num_tokens=num_tokens))
+            result = tree_cache.evict(EvictParams(num_tokens=num_tokens))
+            return int(getattr(result, "num_tokens_evicted", 0))
+    return 0
 
 
 def alloc_paged_token_slots_extend(

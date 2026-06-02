@@ -178,10 +178,31 @@ class SchedulerOutputProcessorMixin:
                 if req.is_chunked <= 0:
                     req.time_stats.set_prefill_finished_time()
 
+                    # Apply text KV control before registering any prefill export,
+                    # so exported handles hold only the compacted prompt KV.
+                    self._maybe_apply_text_kv_control_after_prefill(req)
                     # Export the committed prompt prefix before we fold the first
                     # sampled token into request-local output state.
                     self._maybe_register_prefill_graft_export(req)
-                    self._maybe_apply_text_kv_control_after_prefill(req)
+                    pending_prompt_token = getattr(
+                        req, "text_kv_control_pending_prompt_token", None
+                    )
+                    if pending_prompt_token is not None:
+                        if batch.output_ids is not None:
+                            batch.output_ids[i] = int(pending_prompt_token)
+                        if getattr(batch, "seq_lens", None) is not None:
+                            batch.seq_lens[i] = len(req.origin_input_ids)
+                        if getattr(batch, "seq_lens_cpu", None) is not None:
+                            batch.seq_lens_cpu[i] = len(req.origin_input_ids)
+                        if getattr(batch, "orig_seq_lens", None) is not None:
+                            batch.orig_seq_lens[i] = len(req.origin_input_ids)
+                        logger.info(
+                            "[text_kv_control recompute_first_token_defer] rid=%s pending_prompt_token=%s prompt_tokens=%s",
+                            req.rid,
+                            pending_prompt_token,
+                            len(req.origin_input_ids),
+                        )
+                        continue
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
                     req.check_finished()
@@ -432,6 +453,19 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             new_accepted_len = 1
+            pending_prompt_token = getattr(
+                req, "text_kv_control_pending_prompt_token", None
+            )
+            if pending_prompt_token is not None:
+                req.origin_input_ids.append(pending_prompt_token)
+                req.origin_input_ids_len = len(req.origin_input_ids)
+                req.text_kv_control_pending_prompt_token = None
+                logger.info(
+                    "[text_kv_control recompute_first_token_done] rid=%s restored_prompt_token=%s prompt_tokens=%s",
+                    req.rid,
+                    pending_prompt_token,
+                    len(req.origin_input_ids),
+                )
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
             elif batch.is_spec_v2:
