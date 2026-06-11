@@ -357,15 +357,7 @@ class Scheduler(
     ) -> List[Tuple[int, int]]:
         if total_len <= 0:
             return []
-        uses_round_trigger = (
-            compression.compress_after_rounds is not None
-            and compression.current_round is not None
-        )
-        if uses_round_trigger and int(compression.current_round) <= int(
-            compression.compress_after_rounds
-        ):
-            return [(0, total_len)]
-        if not uses_round_trigger and total_len <= int(compression.compress_after_tokens):
+        if total_len <= int(compression.max_tokens):
             return [(0, total_len)]
 
         budget = min(int(compression.max_tokens), total_len)
@@ -513,6 +505,8 @@ class Scheduler(
     def _kv_compression_triggered(
         total_len: int, compression: KVCompressionSpec
     ) -> bool:
+        if total_len > int(compression.max_tokens):
+            return True
         uses_round_trigger = (
             compression.compress_after_rounds is not None
             and compression.current_round is not None
@@ -1123,6 +1117,9 @@ class Scheduler(
             raise ValueError(
                 f"KV compression profile {compression.profile!r} is not implemented"
             )
+
+        if not self._kv_compression_triggered(total_len, compression):
+            return KVExportPayload(device_indices, token_ids, origin_start)
 
         spans = self._select_old_sparse_spans(total_len, compression)
         kept_len = sum(end - start for start, end in spans)

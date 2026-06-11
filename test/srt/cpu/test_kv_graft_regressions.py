@@ -406,13 +406,45 @@ def test_old_sparse_span_selection_skips_until_round_threshold():
         profile="old_sparse",
         compress_after_rounds=3,
         current_round=3,
+        max_tokens=64,
+        protected_prefix_tokens=3,
+        protected_tail_start_token=28,
+        anchor_spans=2,
+    )
+
+    assert Scheduler._kv_compression_triggered(32, spec) is False
+    assert Scheduler._select_old_sparse_spans(32, spec) == [(0, 32)]
+
+
+def test_old_sparse_hard_budget_overrides_round_threshold():
+    spec = KVCompressionSpec(
+        profile="old_sparse",
+        compress_after_rounds=3,
+        current_round=3,
         max_tokens=8,
         protected_prefix_tokens=3,
         protected_tail_start_token=28,
         anchor_spans=2,
     )
 
-    assert Scheduler._select_old_sparse_spans(32, spec) == [(0, 32)]
+    spans = Scheduler._select_old_sparse_spans(32, spec)
+
+    assert Scheduler._kv_compression_triggered(32, spec) is True
+    assert sum(end - start for start, end in spans) <= 8
+
+
+def test_old_sparse_span_selection_keeps_context_within_budget_after_round_trigger():
+    spec = KVCompressionSpec(
+        profile="old_sparse",
+        compress_after_rounds=2,
+        current_round=5,
+        max_tokens=32,
+        protected_prefix_tokens=3,
+        protected_tail_start_token=24,
+        anchor_spans=2,
+    )
+
+    assert Scheduler._select_old_sparse_spans(28, spec) == [(0, 28)]
 
 
 def test_quantized_kv_compression_profile_quantizes_tail_payload():
@@ -896,6 +928,30 @@ def test_old_sparse_compression_compacts_into_existing_export_indices():
     assert payload.compressed is True
     assert copied
     assert copied[0]["dst_indices"].tolist() == [10, 11]
+
+
+def test_old_sparse_export_keeps_payload_uncompressed_within_budget_after_round_trigger():
+    scheduler = object.__new__(Scheduler)
+    spec = KVCompressionSpec(
+        profile="old_sparse",
+        compress_after_rounds=2,
+        current_round=5,
+        max_tokens=8,
+        protected_prefix_tokens=1,
+        protected_tail_start_token=6,
+        anchor_spans=1,
+    )
+
+    payload = scheduler._maybe_compress_kv_export_payload(
+        device_indices=torch.arange(8, dtype=torch.int64),
+        token_ids=list(range(8)),
+        origin_start=0,
+        compression=spec,
+    )
+
+    assert payload.compressed is False
+    assert payload.device_indices.tolist() == list(range(8))
+    assert payload.token_ids == list(range(8))
 
 
 class _TreeCacheRecorder:
