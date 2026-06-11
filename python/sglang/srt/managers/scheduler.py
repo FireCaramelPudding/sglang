@@ -1568,6 +1568,10 @@ class Scheduler(
             torch.cat(synthetic_indices) if synthetic_indices else torch.empty((0,), dtype=torch.int64)
         )
         req.synthetic_prefix_physical_len = len(req.synthetic_prefix_indices)
+        # The grafted pages already contain committed KV. Seed the committed
+        # length so the first scheduling round binds them as prefix indices
+        # instead of allocating the delta against an empty prefix.
+        req.kv_committed_len = req.synthetic_prefix_physical_len
         req.graft_export_after_prefill = self._should_export_after_prefill(
             recv_req.kv_export, req.prompt_token_count
         )

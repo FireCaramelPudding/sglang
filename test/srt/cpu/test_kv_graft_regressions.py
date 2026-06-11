@@ -1509,6 +1509,7 @@ class TestKVGraftRegressions(unittest.TestCase):
         self.assertIsNone(call["transform"])
         self.assertEqual(call["transform_provenance"], [transform])
         self.assertEqual(req.kv_exports[0].handle, "kvh_materialized")
+        self.assertEqual(req.kv_committed_len, 2)
 
         fake_scheduler.req_to_token_pool = SimpleNamespace(
             req_to_token=torch.tensor([[20, 21, 30, 31]], dtype=torch.int64)
