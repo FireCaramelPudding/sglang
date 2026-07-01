@@ -235,19 +235,9 @@ class MHAGraftMaterializer(BaseKVGraftMaterializer):
                     tuple(k.shape),
                     tuple(v.shape),
                 )
-            if not copy_only and (
-                transform.rescale_profile == "match_stats"
-                and reference_indices is not None
-                and reference_indices.numel() > 0
-            ):
-                ref_k = self.kv_pool.get_key_buffer(layer_id)[reference_indices]
-                ref_v = self.kv_pool.get_value_buffer(layer_id)[reference_indices]
-                k = self._rescale_tensor(k, ref_k)
-                v = self._rescale_tensor(v, ref_v)
-            # Match the local HF path: statistics are aligned in the source
-            # frame first, then K is rotated into the target position.
-            if not copy_only and transform.rope_shift in ("on", "auto") and delta != 0:
-                k = self._rope_shift_tensor(k, delta, origin_start=origin_start)
+            # CHANGED ORDER: k_amplify → rescale → RoPE
+            # This ensures k_amplify works on original KV baseline,
+            # not affected by rescale's scale factor.
             if k_amplify_enabled:
                 actual_count = min(k_amplify_token_count, int(k.shape[0]))
                 if actual_count > 0:
@@ -259,6 +249,28 @@ class MHAGraftMaterializer(BaseKVGraftMaterializer):
                             "[kv_graft k_amplify MHA] mode=%s ratio=%.4f sys_tokens=%s/%s",
                             k_amplify_mode, k_amplify_ratio, actual_count, k_amplify_token_count,
                         )
+            if not copy_only and (
+                transform.rescale_profile == "match_stats"
+                and reference_indices is not None
+                and reference_indices.numel() > 0
+            ):
+                ref_k = self.kv_pool.get_key_buffer(layer_id)[reference_indices]
+                ref_v = self.kv_pool.get_value_buffer(layer_id)[reference_indices]
+                k_before = k if layer_id == layer_ids[0] else None
+                k = self._rescale_tensor(k, ref_k)
+                v = self._rescale_tensor(v, ref_v)
+                if layer_id == layer_ids[0] and k_before is not None:
+                    src_norm = torch.norm(k_before.float(), p=2, dim=-1).mean().item()
+                    rescaled_norm = torch.norm(k.float(), p=2, dim=-1).mean().item()
+                    scale_factor = rescaled_norm / (src_norm + 1e-6)
+                    logger.info(
+                        "[kv_graft rescale MHA] src_norm=%.4f rescaled_norm=%.4f scale=%.4f",
+                        src_norm, rescaled_norm, scale_factor,
+                    )
+            # Match the local HF path: statistics are aligned in the source
+            # frame first, then K is rotated into the target position.
+            if not copy_only and transform.rope_shift in ("on", "auto") and delta != 0:
+                k = self._rope_shift_tensor(k, delta, origin_start=origin_start)
             self.kv_pool.get_key_buffer(layer_id)[dst_indices] = k
             self.kv_pool.get_value_buffer(layer_id)[dst_indices] = v
             if copy_only and layer_id == layer_ids[0]:
@@ -331,18 +343,7 @@ class MLAGraftMaterializer(BaseKVGraftMaterializer):
                     tuple(k_nope.shape),
                     tuple(k_rope.shape),
                 )
-            if not copy_only and (
-                transform.rescale_profile == "match_stats"
-                and reference_indices is not None
-                and reference_indices.numel() > 0
-            ):
-                dst_k_nope, dst_k_rope = self.kv_pool.get_mla_kv_buffer(
-                    layer_stub, reference_indices, dst_dtype=k_nope.dtype
-                )
-                k_nope = self._rescale_tensor(k_nope, dst_k_nope)
-                k_rope = self._rescale_tensor(k_rope, dst_k_rope)
-            if not copy_only and transform.rope_shift in ("on", "auto") and delta != 0:
-                k_rope = self._rope_shift_tensor(k_rope, delta, origin_start=origin_start)
+            # CHANGED ORDER: k_amplify → rescale → RoPE (same as MHA path)
             if k_amplify_enabled:
                 actual_count = min(k_amplify_token_count, int(k_nope.shape[0]))
                 if actual_count > 0:
@@ -355,6 +356,27 @@ class MLAGraftMaterializer(BaseKVGraftMaterializer):
                             "[kv_graft k_amplify MLA] mode=%s ratio=%.4f sys_tokens=%s/%s",
                             k_amplify_mode, k_amplify_ratio, actual_count, k_amplify_token_count,
                         )
+            if not copy_only and (
+                transform.rescale_profile == "match_stats"
+                and reference_indices is not None
+                and reference_indices.numel() > 0
+            ):
+                dst_k_nope, dst_k_rope = self.kv_pool.get_mla_kv_buffer(
+                    layer_stub, reference_indices, dst_dtype=k_nope.dtype
+                )
+                k_nope_before = k_nope if layer_id == layer_ids[0] else None
+                k_nope = self._rescale_tensor(k_nope, dst_k_nope)
+                k_rope = self._rescale_tensor(k_rope, dst_k_rope)
+                if layer_id == layer_ids[0] and k_nope_before is not None:
+                    src_norm = torch.norm(k_nope_before.float(), p=2, dim=-1).mean().item()
+                    rescaled_norm = torch.norm(k_nope.float(), p=2, dim=-1).mean().item()
+                    scale_factor = rescaled_norm / (src_norm + 1e-6)
+                    logger.info(
+                        "[kv_graft rescale MLA] src_norm=%.4f rescaled_norm=%.4f scale=%.4f",
+                        src_norm, rescaled_norm, scale_factor,
+                    )
+            if not copy_only and transform.rope_shift in ("on", "auto") and delta != 0:
+                k_rope = self._rope_shift_tensor(k_rope, delta, origin_start=origin_start)
             self.kv_pool.set_mla_kv_buffer(layer_stub, dst_indices, k_nope, k_rope)
             if copy_only and layer_id == layer_ids[0]:
                 copied_k_nope, copied_k_rope = self.kv_pool.get_mla_kv_buffer(layer_stub, dst_indices, dst_dtype=k_nope.dtype)
