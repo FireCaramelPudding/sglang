@@ -210,12 +210,27 @@ class KVTextControlSpec:
 
 
 @dataclass
+class KVGraftRecomputeTail:
+    token_start: int
+    token_end: int
+
+    def __post_init__(self):
+        if int(self.token_start) < 0:
+            raise ValueError("recompute_tail.token_start must be >= 0")
+        if int(self.token_end) < 0:
+            raise ValueError("recompute_tail.token_end must be >= 0")
+        if int(self.token_end) <= int(self.token_start):
+            raise ValueError("recompute_tail.token_end must be > token_start")
+
+
+@dataclass
 class KVGraftSegment:
     handle: str
     token_start: Optional[int] = None
     token_end: Optional[int] = None
     origin_start: int = 0
     transform: Optional[KVTransformSpec] = None
+    recompute_tail: Optional[Union[KVGraftRecomputeTail, Dict[str, Any]]] = None
 
     def __post_init__(self):
         if self.token_start is not None and self.token_start < 0:
@@ -230,6 +245,13 @@ class KVGraftSegment:
             raise ValueError("token_end must be >= token_start")
         if isinstance(self.transform, dict):
             self.transform = KVTransformSpec(**self.transform)
+        if isinstance(self.recompute_tail, dict):
+            self.recompute_tail = KVGraftRecomputeTail(**self.recompute_tail)
+        if self.recompute_tail is not None:
+            if self.token_end is None:
+                raise ValueError("recompute_tail requires token_end")
+            if int(self.recompute_tail.token_start) != int(self.token_end):
+                raise ValueError("recompute_tail must start at token_end")
 
 
 @dataclass

@@ -1542,7 +1542,35 @@ class Scheduler(
         owned_indices: List[torch.Tensor] = []
         aliased_indices: List[torch.Tensor] = []
         synthetic_owned_masks: List[torch.Tensor] = []
+        recompute_tail_tokens: List[int] = []
+        if any(
+            getattr(segment, "recompute_tail", None) is not None
+            for segment in recv_req.kv_graft.segments
+        ) and len(recv_req.kv_graft.segments) != 1:
+            raise ValueError("recompute_tail supports exactly one graft segment")
         for segment in recv_req.kv_graft.segments:
+            recompute_tail = getattr(segment, "recompute_tail", None)
+            if recompute_tail is not None:
+                entry = self.kv_handle_registry.lookup(
+                    segment.handle, tree_cache=self.tree_cache
+                )
+                tail_start = int(recompute_tail.token_start)
+                tail_end = int(recompute_tail.token_end)
+                token_end = (
+                    int(segment.token_end)
+                    if segment.token_end is not None
+                    else len(entry.token_ids)
+                )
+                if (
+                    tail_start != token_end
+                    or tail_start < 0
+                    or tail_end > len(entry.token_ids)
+                    or tail_end <= tail_start
+                ):
+                    raise ValueError(
+                        f"Invalid recompute_tail for handle {segment.handle}"
+                    )
+                recompute_tail_tokens.extend(entry.token_ids[tail_start:tail_end])
             seg_indices, seg_tokens, is_owned = Scheduler._resolve_graft_segment(
                 self,
                 req, segment, [x for t in synthetic_indices for x in t.tolist()], synthetic_tokens
@@ -1561,6 +1589,11 @@ class Scheduler(
                 owned_indices.append(seg_indices)
             else:
                 aliased_indices.append(seg_indices)
+
+        if recompute_tail_tokens:
+            req.origin_input_ids = recompute_tail_tokens + list(req.origin_input_ids)
+            req.origin_input_ids_len = len(req.origin_input_ids)
+            req.origin_input_ids_unpadded = req.origin_input_ids
 
         req.kv_graft_spec = recv_req.kv_graft
         req.synthetic_prefix_token_ids = synthetic_tokens
@@ -1602,6 +1635,10 @@ class Scheduler(
             and recv_req.kv_export.materialize_graft_prefix
             and req.synthetic_prefix_indices.numel() > 0
             and not req.lazy_quantized_graft_segments
+            and not any(
+                getattr(segment, "recompute_tail", None) is not None
+                for segment in recv_req.kv_graft.segments
+            )
             and any(segment.transform is not None for segment in recv_req.kv_graft.segments)
         ):
             spec = recv_req.kv_export
@@ -1610,10 +1647,26 @@ class Scheduler(
                 for segment in recv_req.kv_graft.segments
                 if segment.transform is not None
             ]
+            # Use actual prefix_indices length instead of synthetic_prefix_token_ids
+            # to handle tail_recompute tokenization inconsistencies.
+            # req.prefix_indices contains the actual materialized KV after prefill.
+            actual_token_count = len(req.prefix_indices)
+            actual_token_ids = req.synthetic_prefix_token_ids[:actual_token_count]
+            actual_indices = req.prefix_indices
+
+            if len(req.synthetic_prefix_token_ids) != actual_token_count:
+                logger.warning(
+                    "[kv_graft token_alignment] rid=%s expected_tokens=%s actual_tokens=%s delta=%s",
+                    req.rid,
+                    len(req.synthetic_prefix_token_ids),
+                    actual_token_count,
+                    actual_token_count - len(req.synthetic_prefix_token_ids),
+                )
+
             payload = Scheduler._maybe_compress_kv_export_payload(
                 self,
-                device_indices=req.synthetic_prefix_indices,
-                token_ids=req.synthetic_prefix_token_ids,
+                device_indices=actual_indices,
+                token_ids=actual_token_ids,
                 origin_start=0,
                 compression=getattr(spec, "compression", None),
             )
