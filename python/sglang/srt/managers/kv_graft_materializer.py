@@ -15,6 +15,11 @@ logger = logging.getLogger(__name__)
 _RESCALE_SHAPE_MISMATCH_FAIL_FAST = get_bool_env_var(
     "SGLANG_KV_GRAFT_RESCALE_SHAPE_MISMATCH_FAIL_FAST"
 )
+# Diagnostic-only: when enabled, _rescale_tensor logs the per-token norm
+# distribution of src/tgt before collapsing to a single global scale. Used to
+# judge whether a global scalar rescale loses meaningful per-token detail (large
+# std/mean ratio => segmented rescale would matter). Default off to avoid spam.
+_RESCALE_NORM_DEBUG = get_bool_env_var("SGLANG_KV_GRAFT_RESCALE_NORM_DEBUG")
 
 
 @dataclass
@@ -99,6 +104,28 @@ class BaseKVGraftMaterializer:
         tgt_norm = torch.norm(tgt_f, p=2, dim=-1, keepdim=True)
         if src_norm.numel() == 0 or tgt_norm.numel() == 0:
             return src
+
+        if _RESCALE_NORM_DEBUG:
+            # Report per-token norm spread *before* collapsing to a global scale.
+            # A large std/mean ratio means tokens differ a lot in magnitude, so a
+            # single global scale under/over-scales many of them (Bug 1 evidence).
+            def _spread(norms: torch.Tensor) -> tuple[float, float, float, float]:
+                flat = norms.float().reshape(-1)
+                mean = flat.mean().item()
+                std = flat.std(unbiased=False).item() if flat.numel() > 1 else 0.0
+                return mean, std, flat.min().item(), flat.max().item()
+
+            s_mean, s_std, s_min, s_max = _spread(src_norm)
+            t_mean, t_std, t_min, t_max = _spread(tgt_norm)
+            logger.info(
+                "[kv_graft rescale norm_debug] "
+                "src(mean=%.4f std=%.4f min=%.4f max=%.4f std/mean=%.3f) "
+                "tgt(mean=%.4f std=%.4f min=%.4f max=%.4f std/mean=%.3f) "
+                "global_scale=%.4f",
+                s_mean, s_std, s_min, s_max, (s_std / (s_mean + eps)),
+                t_mean, t_std, t_min, t_max, (t_std / (t_mean + eps)),
+                (t_mean / (s_mean + eps)),
+            )
 
         src_norm = BaseKVGraftMaterializer._summarize_norms_for_rescale(src_norm)
         tgt_norm = BaseKVGraftMaterializer._summarize_norms_for_rescale(tgt_norm)

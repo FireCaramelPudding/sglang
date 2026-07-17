@@ -12,12 +12,15 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.managers.io_struct import (
     KVCompressionSpec,
     KVExportSpec,
+    KVGraftSegment,
+    KVGraftSpec,
     KVKAmplifySpec,
     KVTextControlSpec,
     ReleaseKVHandlesReqOutput,
 )
 from sglang.srt.managers.kv_handle_registry import KVHandleRegistry
 from sglang.srt.managers.kv_graft_materializer import (
+    BaseKVGraftMaterializer,
     MHAGraftMaterializer,
     MLAGraftMaterializer,
 )
@@ -1016,6 +1019,42 @@ class _ApplyMaterializeReq(_ApplyGraftReq):
         self.kv_exports = []
 
 
+class _TailRecomputeReq(_ApplyGraftReq):
+    """Req that mirrors the real logical_fill_ids layout for tail_recompute:
+    logical_fill_ids = synthetic_prefix_token_ids + origin_input_ids + output_ids.
+    Used to verify the export token/index alignment of the recompute-tail path.
+    """
+
+    def __init__(self, origin_input_ids):
+        super().__init__()
+        self.rid = "req_tail"
+        self.prompt_token_count = 0
+        self.kv_exports = []
+        self.origin_input_ids = list(origin_input_ids)
+        self.origin_input_ids_len = len(origin_input_ids)
+        self.origin_input_ids_unpadded = list(origin_input_ids)
+        self.output_ids = []
+        self.req_pool_idx = 0
+
+    @property
+    def synthetic_prefix_len(self):
+        return len(self.synthetic_prefix_token_ids)
+
+    @property
+    def logical_fill_ids(self):
+        return (
+            list(self.synthetic_prefix_token_ids)
+            + list(self.origin_input_ids)
+            + list(self.output_ids)
+        )
+
+    def get_exportable_logical_token_ids(self, committed_len=None):
+        ids = self.logical_fill_ids
+        if committed_len is None:
+            committed_len = self.kv_committed_len
+        return ids[: min(committed_len, len(ids))]
+
+
 class _MixedRunningReq:
     def __init__(self):
         self.origin_input_ids = [1, 2]
@@ -1311,6 +1350,36 @@ class TestKVGraftRegressions(unittest.TestCase):
 
         self.assertEqual(materializer.ops, ["rescale", "rescale", "rope"])
 
+    def test_rescale_tensor_matches_target_norm_globally(self):
+        # Global scalar rescale must bring src's mean per-token norm to tgt's.
+        src = torch.tensor([[3.0, 4.0], [6.0, 8.0]])  # norms 5, 10
+        tgt = torch.tensor([[1.0, 0.0], [0.0, 1.0]])  # norms 1, 1
+        out = BaseKVGraftMaterializer._rescale_tensor(src, tgt)
+        src_mean = torch.norm(src, p=2, dim=-1).mean()
+        tgt_mean = torch.norm(tgt, p=2, dim=-1).mean()
+        out_mean = torch.norm(out, p=2, dim=-1).mean()
+        self.assertAlmostEqual(out_mean.item(), tgt_mean.item(), places=4)
+        # A global scalar preserves the *relative* per-token norm structure:
+        # the src 1:2 norm ratio survives in the output.
+        out_norms = torch.norm(out, p=2, dim=-1)
+        self.assertAlmostEqual(
+            (out_norms[1] / out_norms[0]).item(), 2.0, places=4
+        )
+
+    def test_rescale_norm_debug_gate_is_side_effect_free(self):
+        # Diagnostic logging must not alter the returned tensor whether on or off.
+        src = torch.tensor([[3.0, 4.0], [6.0, 8.0]])
+        tgt = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        with patch(
+            "sglang.srt.managers.kv_graft_materializer._RESCALE_NORM_DEBUG", False
+        ):
+            off = BaseKVGraftMaterializer._rescale_tensor(src, tgt)
+        with patch(
+            "sglang.srt.managers.kv_graft_materializer._RESCALE_NORM_DEBUG", True
+        ):
+            on = BaseKVGraftMaterializer._rescale_tensor(src, tgt)
+        self.assertTrue(torch.allclose(off, on))
+
     def test_kv_export_uses_committed_helper(self):
         registry = _RecordingRegistry()
         req_to_token_pool = SimpleNamespace(
@@ -1531,6 +1600,187 @@ class TestKVGraftRegressions(unittest.TestCase):
         self.assertTrue(full_call["materialized"])
         self.assertEqual(full_call["transform_provenance"], [transform])
         self.assertEqual(len(req.kv_exports), 2)
+
+    def test_apply_kv_graft_recompute_tail_prepends_tokens_and_export_stays_aligned(self):
+        """Tail-recompute must prepend the tail token_ids to origin_input_ids and
+        graft only the reused prefix, while the follow-up export keeps token_ids
+        and device_indices the same length (no drift) with origin_start=0.
+        """
+        # Source handle: 6 committed tokens. Reuse prefix [0,4), recompute tail [4,6).
+        entry = SimpleNamespace(
+            meta=SimpleNamespace(
+                model_key="model", backend="mha", origin_start=0,
+                compressed_token_count=None,
+            ),
+            device_indices=torch.arange(10, 16, dtype=torch.int64),
+            token_ids=[100, 101, 102, 103, 104, 105],
+            quantized_tail=None,
+        )
+        registry = _LookupRecordingRegistry(entry)
+        allocator = _AllocRecorder()
+        fake_scheduler = SimpleNamespace(
+            kv_handle_registry=registry,
+            tree_cache=SimpleNamespace(evict=lambda need: []),
+            token_to_kv_pool_allocator=allocator,
+            kv_graft_materializer=_MaterializerRecorder(),
+            tp_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(kv_cache_dtype=torch.bfloat16)
+            ),
+            _graft_layer_ids=lambda: [0],
+            _kv_export_handle=lambda req, idx: f"kvh_{idx}",
+        )
+        fake_scheduler._resolve_graft_segment = lambda req, segment, cpi, cpt: (
+            Scheduler._resolve_graft_segment(fake_scheduler, req, segment, cpi, cpt)
+        )
+        fake_scheduler._should_export_after_prefill = lambda spec, plen: (
+            Scheduler._should_export_after_prefill(fake_scheduler, spec, plen)
+        )
+
+        # Plain graft (transform=None) resolves via the alias path, so the reused
+        # prefix keeps the source device indices unchanged.
+        segment = KVGraftSegment(
+            handle="kvh_source",
+            token_start=0,
+            token_end=4,
+            recompute_tail={"token_start": 4, "token_end": 6},
+            transform=None,
+        )
+        recv_req = SimpleNamespace(
+            kv_export=KVExportSpec(token_start=0, ttl_seconds=100, name="tail"),
+            input_ids=[900, 901, 902],
+            kv_graft=KVGraftSpec(segments=[segment]),
+        )
+        req = _TailRecomputeReq(origin_input_ids=[900, 901, 902])
+
+        Scheduler._apply_kv_graft(fake_scheduler, req, recv_req)
+
+        # Tail token_ids (104,105) prepended before the new delta tokens.
+        self.assertEqual(req.origin_input_ids, [104, 105, 900, 901, 902])
+        # Only the reused prefix [0,4) is grafted as synthetic KV.
+        self.assertEqual(req.synthetic_prefix_token_ids, [100, 101, 102, 103])
+        self.assertEqual(req.synthetic_prefix_physical_len, 4)
+        # Full logical sequence = 4 prefix + 2 tail + 3 delta.
+        self.assertEqual(
+            req.logical_fill_ids,
+            [100, 101, 102, 103, 104, 105, 900, 901, 902],
+        )
+
+        # Simulate prefill completion covering the whole logical sequence.
+        req.kv_committed_len = len(req.logical_fill_ids)
+        n = req.kv_committed_len
+        fake_scheduler.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(0, n, dtype=torch.int64).reshape(1, n)
+        )
+
+        def _passthrough(device_indices, token_ids, origin_start, compression):
+            return SimpleNamespace(
+                device_indices=device_indices,
+                token_ids=token_ids,
+                origin_start=origin_start,
+                compressed=False,
+                compression_type=None,
+                original_token_count=len(token_ids),
+                compressed_token_count=len(token_ids),
+                compression_spans=None,
+                quantized_tail_start_token=None,
+                quantization_bits=None,
+                quantized_tail=None,
+            )
+
+        fake_scheduler._maybe_compress_kv_export_payload = (
+            lambda self_, device_indices, token_ids, origin_start, compression: _passthrough(
+                device_indices, token_ids, origin_start, compression
+            )
+        )
+
+        Scheduler._maybe_register_kv_export(fake_scheduler, req)
+
+        self.assertEqual(len(registry.register_calls), 1)
+        call = registry.register_calls[0]
+        # No drift: exported token_ids and device_indices have equal length,
+        # covering the full logical sequence with origin_start=0.
+        self.assertEqual(len(call["token_ids"]), len(call["device_indices"]))
+        self.assertEqual(
+            call["token_ids"], [100, 101, 102, 103, 104, 105, 900, 901, 902]
+        )
+        self.assertEqual(call["origin_start"], 0)
+        self.assertTrue(call["composite"])
+
+    def test_apply_kv_graft_recompute_tail_rejects_multiple_segments(self):
+        """recompute_tail is only well-defined for a single graft segment; a
+        multi-segment request must fail loudly rather than silently mis-slice."""
+        entry = SimpleNamespace(
+            meta=SimpleNamespace(
+                model_key="model", backend="mha", origin_start=0,
+                compressed_token_count=None,
+            ),
+            device_indices=torch.arange(10, 16, dtype=torch.int64),
+            token_ids=[100, 101, 102, 103, 104, 105],
+            quantized_tail=None,
+        )
+        fake_scheduler = SimpleNamespace(
+            kv_handle_registry=_LookupRecordingRegistry(entry),
+            tree_cache=SimpleNamespace(evict=lambda need: []),
+        )
+        seg_a = KVGraftSegment(
+            handle="kvh_a",
+            token_start=0,
+            token_end=4,
+            recompute_tail={"token_start": 4, "token_end": 6},
+        )
+        seg_b = KVGraftSegment(handle="kvh_b", token_start=0, token_end=4)
+        recv_req = SimpleNamespace(
+            kv_export=KVExportSpec(token_start=0, ttl_seconds=100, name="tail"),
+            input_ids=[900],
+            kv_graft=KVGraftSpec(segments=[seg_a, seg_b]),
+        )
+        req = _TailRecomputeReq(origin_input_ids=[900])
+
+        with self.assertRaises(ValueError):
+            Scheduler._apply_kv_graft(fake_scheduler, req, recv_req)
+
+    def test_apply_kv_graft_recompute_tail_rejects_out_of_range_tail(self):
+        """A tail whose token_end exceeds the source handle length must raise,
+        not export a truncated/misaligned handle."""
+        entry = SimpleNamespace(
+            meta=SimpleNamespace(
+                model_key="model", backend="mha", origin_start=0,
+                compressed_token_count=None,
+            ),
+            device_indices=torch.arange(10, 14, dtype=torch.int64),
+            token_ids=[100, 101, 102, 103],
+            quantized_tail=None,
+        )
+        registry = _LookupRecordingRegistry(entry)
+        fake_scheduler = SimpleNamespace(
+            kv_handle_registry=registry,
+            tree_cache=SimpleNamespace(evict=lambda need: []),
+            token_to_kv_pool_allocator=_AllocRecorder(),
+            kv_graft_materializer=_MaterializerRecorder(),
+            tp_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(kv_cache_dtype=torch.bfloat16)
+            ),
+            _graft_layer_ids=lambda: [0],
+        )
+        fake_scheduler._resolve_graft_segment = lambda req, segment, cpi, cpt: (
+            Scheduler._resolve_graft_segment(fake_scheduler, req, segment, cpi, cpt)
+        )
+        # Source has 4 tokens; tail [4,6) runs past the end.
+        segment = KVGraftSegment(
+            handle="kvh_source",
+            token_start=0,
+            token_end=4,
+            recompute_tail={"token_start": 4, "token_end": 6},
+        )
+        recv_req = SimpleNamespace(
+            kv_export=KVExportSpec(token_start=0, ttl_seconds=100, name="tail"),
+            input_ids=[900],
+            kv_graft=KVGraftSpec(segments=[segment]),
+        )
+        req = _TailRecomputeReq(origin_input_ids=[900])
+
+        with self.assertRaises(ValueError):
+            Scheduler._apply_kv_graft(fake_scheduler, req, recv_req)
 
     def test_graft_transform_offsets_origin_start_by_token_start(self):
         entry = SimpleNamespace(
