@@ -1426,6 +1426,7 @@ class MessageProcessingResult:
     modalities: List[str]
     stop: List[str]
     tool_call_constraint: Optional[ToolCallConstraint] = None
+    assistant_turn_start: Optional[int] = None
 
 
 class ToolCallProcessingResult(NamedTuple):

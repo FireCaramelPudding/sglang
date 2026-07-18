@@ -134,6 +134,35 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertFalse(adapted.stream)
             self.assertEqual(processed, self.basic_req)
 
+    def test_convert_resolves_assistant_turn_kv_export_scope(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Summarize"}],
+            sgl_kv_export={
+                "scope": "assistant_turn",
+                "ttl_seconds": 300,
+            },
+        )
+        with patch.object(self.chat, "_process_messages") as proc_mock:
+            proc_mock.return_value = MessageProcessingResult(
+                prompt="prompt",
+                prompt_ids=[1, 2, 3],
+                image_data=None,
+                video_data=None,
+                audio_data=None,
+                modalities=[],
+                stop=[],
+                assistant_turn_start=2,
+            )
+
+            adapted, _ = self.chat._convert_to_internal_request(req)
+
+        self.assertEqual(
+            adapted.kv_export,
+            {"ttl_seconds": 300, "token_start": 2},
+        )
+        self.assertEqual(req.sgl_kv_export["scope"], "assistant_turn")
+
     def test_jinja_uses_openai_tool_schema_first(self):
         """Ensure Jinja chat templates receive OpenAI-shaped tools by default."""
         self.template_manager.chat_template_name = None

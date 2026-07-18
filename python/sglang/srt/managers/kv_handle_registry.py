@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -313,6 +314,9 @@ class KVHandleRegistry:
             compression_spans=compression_spans,
             quantized_tail_start_token=quantized_tail_start_token,
             quantization_bits=quantization_bits,
+            token_ids_sha256=hashlib.sha256(
+                ",".join(str(int(token_id)) for token_id in token_ids).encode("ascii")
+            ).hexdigest(),
         )
         entry = KVHandleEntry(
             meta=meta,

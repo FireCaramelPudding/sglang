@@ -317,6 +317,7 @@ class KVHandleMeta:
     compression_spans: Optional[List[Tuple[int, int]]] = None
     quantized_tail_start_token: Optional[int] = None
     quantization_bits: Optional[int] = None
+    token_ids_sha256: Optional[str] = None
 
 
 @dataclass

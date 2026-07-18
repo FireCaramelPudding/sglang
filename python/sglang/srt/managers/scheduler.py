@@ -1543,11 +1543,17 @@ class Scheduler(
         aliased_indices: List[torch.Tensor] = []
         synthetic_owned_masks: List[torch.Tensor] = []
         recompute_tail_tokens: List[int] = []
-        if any(
-            getattr(segment, "recompute_tail", None) is not None
-            for segment in recv_req.kv_graft.segments
-        ) and len(recv_req.kv_graft.segments) != 1:
-            raise ValueError("recompute_tail supports exactly one graft segment")
+        tail_segment_indices = [
+            index
+            for index, segment in enumerate(recv_req.kv_graft.segments)
+            if getattr(segment, "recompute_tail", None) is not None
+        ]
+        if tail_segment_indices and tail_segment_indices != [
+            len(recv_req.kv_graft.segments) - 1
+        ]:
+            raise ValueError(
+                "recompute_tail is supported only on the final graft segment"
+            )
         for segment in recv_req.kv_graft.segments:
             recompute_tail = getattr(segment, "recompute_tail", None)
             if recompute_tail is not None:
@@ -1630,80 +1636,10 @@ class Scheduler(
             int(req.graft_aliased_indices.numel()),
             int(req.graft_prefix_owned_mask.sum().item()) if req.graft_prefix_owned_mask.numel() > 0 else 0,
         )
-        if (
-            recv_req.kv_export is not None
-            and recv_req.kv_export.materialize_graft_prefix
-            and req.synthetic_prefix_indices.numel() > 0
-            and not req.lazy_quantized_graft_segments
-            and not any(
-                getattr(segment, "recompute_tail", None) is not None
-                for segment in recv_req.kv_graft.segments
-            )
-            and any(segment.transform is not None for segment in recv_req.kv_graft.segments)
-        ):
-            spec = recv_req.kv_export
-            transform_provenance = [
-                segment.transform
-                for segment in recv_req.kv_graft.segments
-                if segment.transform is not None
-            ]
-            # Use actual prefix_indices length instead of synthetic_prefix_token_ids
-            # to handle tail_recompute tokenization inconsistencies.
-            # req.prefix_indices contains the actual materialized KV after prefill.
-            actual_token_count = len(req.prefix_indices)
-            actual_token_ids = req.synthetic_prefix_token_ids[:actual_token_count]
-            actual_indices = req.prefix_indices
-
-            if len(req.synthetic_prefix_token_ids) != actual_token_count:
-                logger.warning(
-                    "[kv_graft token_alignment] rid=%s expected_tokens=%s actual_tokens=%s delta=%s",
-                    req.rid,
-                    len(req.synthetic_prefix_token_ids),
-                    actual_token_count,
-                    actual_token_count - len(req.synthetic_prefix_token_ids),
-                )
-
-            payload = Scheduler._maybe_compress_kv_export_payload(
-                self,
-                device_indices=actual_indices,
-                token_ids=actual_token_ids,
-                origin_start=0,
-                compression=getattr(spec, "compression", None),
-            )
-            meta = self.kv_handle_registry.register(
-                allocator=self.token_to_kv_pool_allocator,
-                device_indices=payload.device_indices,
-                token_ids=payload.token_ids,
-                origin_start=payload.origin_start,
-                dtype=str(self.tp_worker.model_runner.kv_cache_dtype),
-                created_from_rid=req.rid,
-                ttl_seconds=spec.ttl_seconds,
-                persist=spec.persist,
-                name=spec.name,
-                composite=True,
-                transform=None,
-                materialized=True,
-                transform_provenance=transform_provenance,
-                compressed=payload.compressed,
-                compression_type=payload.compression_type,
-                original_token_count=payload.original_token_count,
-                compressed_token_count=payload.compressed_token_count,
-                compression_spans=payload.compression_spans,
-                quantized_tail_start_token=payload.quantized_tail_start_token,
-                quantization_bits=payload.quantization_bits,
-                quantized_tail=payload.quantized_tail,
-                handle=Scheduler._kv_export_handle(
-                    self, req, len(req.kv_exports or [])
-                ),
-            )
-            req.kv_exports = [meta]
-            logger.info(
-                "[kv_graft materialize] rid=%s handle=%s token_count=%s transform_segments=%s",
-                req.rid,
-                meta.handle,
-                meta.token_count,
-                len(transform_provenance),
-            )
+        # Full materialized exports are registered only after prefill/decode has
+        # bound the request's logical token sequence to req_to_token_pool. Doing
+        # this during request construction observes an empty req.prefix_indices
+        # and creates a spurious zero-token handle.
 
     def _materialize_lazy_quantized_graft_for_extend(self, req: Req) -> None:
         descriptors = getattr(req, "lazy_quantized_graft_segments", None)

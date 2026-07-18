@@ -291,6 +291,26 @@ class OpenAIServingChat(OpenAIServingBase):
         img_max_dynamic_patch, vid_max_dynamic_patch = _extract_max_dynamic_patch(
             request
         )
+        kv_graft, kv_export, kv_text_control = self._get_sgl_kv_fields(request)
+        if kv_export is not None:
+            kv_export = dict(kv_export)
+            scope = kv_export.pop("scope", None)
+            if scope == "assistant_turn":
+                if processed_messages.assistant_turn_start is None:
+                    raise ValueError(
+                        "sgl_kv_export scope=assistant_turn is unsupported "
+                        "for the active chat template"
+                    )
+                kv_export["token_start"] = processed_messages.assistant_turn_start
+            elif scope == "completion":
+                if not isinstance(processed_messages.prompt_ids, list):
+                    raise ValueError(
+                        "sgl_kv_export scope=completion requires tokenized prompt ids"
+                    )
+                kv_export["token_start"] = len(processed_messages.prompt_ids)
+            elif scope not in (None, "full"):
+                raise ValueError(f"Unsupported sgl_kv_export scope: {scope}")
+
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             image_data=processed_messages.image_data,
@@ -321,9 +341,9 @@ class OpenAIServingChat(OpenAIServingBase):
             image_max_dynamic_patch=img_max_dynamic_patch,
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
-            kv_graft=self._get_sgl_kv_fields(request)[0],
-            kv_export=self._get_sgl_kv_fields(request)[1],
-            kv_text_control=self._get_sgl_kv_fields(request)[2],
+            kv_graft=kv_graft,
+            kv_export=kv_export,
+            kv_text_control=kv_text_control,
         )
 
         return adapted_request, request
@@ -389,6 +409,7 @@ class OpenAIServingChat(OpenAIServingBase):
         video_data = []
         audio_data = []
         modalities = []
+        assistant_turn_start = None
 
         template_content_format = self.template_manager.jinja_template_content_format
 
@@ -479,8 +500,24 @@ class OpenAIServingChat(OpenAIServingBase):
                 extra_template_kwargs["reasoning_effort"] = request.reasoning_effort
             if request.chat_template_kwargs:
                 extra_template_kwargs.update(request.chat_template_kwargs)
+            needs_assistant_turn_boundary = (
+                (getattr(request, "sgl_kv_export", None) or {}).get("scope")
+                == "assistant_turn"
+            )
 
             try:
+                prompt_without_generation = (
+                    self.tokenizer_manager.tokenizer.apply_chat_template(
+                        openai_compatible_messages,
+                        tokenize=True,
+                        add_generation_prompt=False,
+                        tools=tools,
+                        return_dict=False,
+                        **extra_template_kwargs,
+                    )
+                    if needs_assistant_turn_boundary
+                    else None
+                )
                 prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
                     openai_compatible_messages,
                     tokenize=True,
@@ -489,6 +526,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     return_dict=False,
                     **extra_template_kwargs,
                 )
+                if prompt_without_generation is not None:
+                    assistant_turn_start = len(prompt_without_generation)
             except Exception as e:
                 # If the first attempt fails, try with flat function-only format.
                 # Some templates (e.g. Mistral) expect tools without the OpenAI wrapper.
@@ -498,6 +537,18 @@ class OpenAIServingChat(OpenAIServingBase):
                     else None
                 )
                 try:
+                    prompt_without_generation = (
+                        self.tokenizer_manager.tokenizer.apply_chat_template(
+                            openai_compatible_messages,
+                            tokenize=True,
+                            add_generation_prompt=False,
+                            tools=tools,
+                            return_dict=False,
+                            **extra_template_kwargs,
+                        )
+                        if needs_assistant_turn_boundary
+                        else None
+                    )
                     prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
                         openai_compatible_messages,
                         tokenize=True,
@@ -506,6 +557,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         return_dict=False,
                         **extra_template_kwargs,
                     )
+                    if prompt_without_generation is not None:
+                        assistant_turn_start = len(prompt_without_generation)
                 except jinja2.TemplateError as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
                     # should be treated as client errors (400 BadRequest)
@@ -533,6 +586,7 @@ class OpenAIServingChat(OpenAIServingBase):
             audio_data=audio_data,
             modalities=modalities,
             stop=stop,
+            assistant_turn_start=assistant_turn_start,
         )
 
     def _apply_conversation_template(

@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -1238,6 +1239,14 @@ class TestKVGraftRegressions(unittest.TestCase):
         )
 
         self.assertNotEqual(first.handle, second.handle)
+        self.assertEqual(
+            first.token_ids_sha256,
+            hashlib.sha256(b"11,12").hexdigest(),
+        )
+        self.assertEqual(
+            second.token_ids_sha256,
+            hashlib.sha256(b"13,14,15").hexdigest(),
+        )
         self.assertTrue(first.handle.startswith("kvh_same_rid_"))
         self.assertTrue(second.handle.startswith("kvh_same_rid_"))
         self.assertEqual(set(registry._entries.keys()), {first.handle, second.handle})
@@ -1568,16 +1577,10 @@ class TestKVGraftRegressions(unittest.TestCase):
         Scheduler._apply_kv_graft(fake_scheduler, req, recv_req)
 
         self.assertEqual(len(materializer.calls), 1)
-        self.assertEqual(len(registry.register_calls), 1)
-        call = registry.register_calls[0]
-        self.assertEqual(call["device_indices"].tolist(), [20, 21])
-        self.assertEqual(call["token_ids"], [100, 101])
-        self.assertEqual(call["origin_start"], 0)
-        self.assertTrue(call["composite"])
-        self.assertTrue(call["materialized"])
-        self.assertIsNone(call["transform"])
-        self.assertEqual(call["transform_provenance"], [transform])
-        self.assertEqual(req.kv_exports[0].handle, "kvh_materialized")
+        # Request construction has no req_to_token_pool binding yet. Registering
+        # here used to create a misleading zero-token/partial handle.
+        self.assertEqual(len(registry.register_calls), 0)
+        self.assertEqual(req.kv_exports, [])
         self.assertEqual(req.kv_committed_len, 2)
 
         fake_scheduler.req_to_token_pool = SimpleNamespace(
@@ -1591,15 +1594,16 @@ class TestKVGraftRegressions(unittest.TestCase):
 
         Scheduler._maybe_register_kv_export(fake_scheduler, req)
 
-        self.assertEqual(len(registry.register_calls), 2)
-        full_call = registry.register_calls[1]
+        self.assertEqual(len(registry.register_calls), 1)
+        full_call = registry.register_calls[0]
         self.assertEqual(full_call["device_indices"].tolist(), [20, 21, 30, 31])
         self.assertEqual(full_call["token_ids"], [100, 101, 200, 201])
         self.assertEqual(full_call["origin_start"], 0)
         self.assertTrue(full_call["composite"])
         self.assertTrue(full_call["materialized"])
         self.assertEqual(full_call["transform_provenance"], [transform])
-        self.assertEqual(len(req.kv_exports), 2)
+        self.assertEqual(len(req.kv_exports), 1)
+        self.assertEqual(req.kv_exports[0].handle, "kvh_materialized")
 
     def test_apply_kv_graft_recompute_tail_prepends_tokens_and_export_stays_aligned(self):
         """Tail-recompute must prepend the tail token_ids to origin_input_ids and
@@ -1706,9 +1710,8 @@ class TestKVGraftRegressions(unittest.TestCase):
         self.assertEqual(call["origin_start"], 0)
         self.assertTrue(call["composite"])
 
-    def test_apply_kv_graft_recompute_tail_rejects_multiple_segments(self):
-        """recompute_tail is only well-defined for a single graft segment; a
-        multi-segment request must fail loudly rather than silently mis-slice."""
+    def test_apply_kv_graft_recompute_tail_rejects_nonfinal_segment(self):
+        """Only the final graft segment may contribute recomputed suffix tokens."""
         entry = SimpleNamespace(
             meta=SimpleNamespace(
                 model_key="model", backend="mha", origin_start=0,
@@ -1738,6 +1741,54 @@ class TestKVGraftRegressions(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             Scheduler._apply_kv_graft(fake_scheduler, req, recv_req)
+
+    def test_apply_kv_graft_recompute_tail_allows_final_segment(self):
+        entry = SimpleNamespace(
+            meta=SimpleNamespace(
+                model_key="model",
+                backend="mha",
+                origin_start=0,
+                compressed_token_count=None,
+            ),
+            device_indices=torch.arange(10, 16, dtype=torch.int64),
+            token_ids=[100, 101, 102, 103, 104, 105],
+            quantized_tail=None,
+        )
+        registry = _LookupRecordingRegistry(entry)
+        fake_scheduler = SimpleNamespace(
+            kv_handle_registry=registry,
+            tree_cache=SimpleNamespace(evict=lambda need: []),
+            token_to_kv_pool_allocator=_AllocRecorder(),
+        )
+        fake_scheduler._should_export_after_prefill = lambda spec, plen: (
+            Scheduler._should_export_after_prefill(fake_scheduler, spec, plen)
+        )
+        seg_a = KVGraftSegment(
+            handle="kvh_main",
+            token_start=0,
+            token_end=2,
+        )
+        seg_b = KVGraftSegment(
+            handle="kvh_summary",
+            token_start=0,
+            token_end=4,
+            recompute_tail={"token_start": 4, "token_end": 6},
+        )
+        recv_req = SimpleNamespace(
+            kv_export=KVExportSpec(token_start=0, ttl_seconds=100, name="tail"),
+            input_ids=[900],
+            kv_graft=KVGraftSpec(segments=[seg_a, seg_b]),
+        )
+        req = _TailRecomputeReq(origin_input_ids=[900])
+
+        Scheduler._apply_kv_graft(fake_scheduler, req, recv_req)
+
+        self.assertEqual(
+            req.synthetic_prefix_token_ids,
+            [100, 101, 100, 101, 102, 103],
+        )
+        self.assertEqual(req.origin_input_ids, [104, 105, 900])
+        self.assertEqual(req.synthetic_prefix_physical_len, 6)
 
     def test_apply_kv_graft_recompute_tail_rejects_out_of_range_tail(self):
         """A tail whose token_end exceeds the source handle length must raise,
