@@ -1562,21 +1562,34 @@ class Scheduler(
                 )
                 tail_start = int(recompute_tail.token_start)
                 tail_end = int(recompute_tail.token_end)
+                target_tail_token_ids = getattr(
+                    recompute_tail, "token_ids", None
+                )
                 token_end = (
                     int(segment.token_end)
                     if segment.token_end is not None
                     else len(entry.token_ids)
                 )
-                if (
+                invalid_tail = (
                     tail_start != token_end
                     or tail_start < 0
-                    or tail_end > len(entry.token_ids)
                     or tail_end <= tail_start
-                ):
+                )
+                if target_tail_token_ids is None:
+                    invalid_tail = (
+                        invalid_tail or tail_end > len(entry.token_ids)
+                    )
+                elif len(target_tail_token_ids) != tail_end - tail_start:
+                    invalid_tail = True
+                if invalid_tail:
                     raise ValueError(
                         f"Invalid recompute_tail for handle {segment.handle}"
                     )
-                recompute_tail_tokens.extend(entry.token_ids[tail_start:tail_end])
+                recompute_tail_tokens.extend(
+                    target_tail_token_ids
+                    if target_tail_token_ids is not None
+                    else entry.token_ids[tail_start:tail_end]
+                )
             seg_indices, seg_tokens, is_owned = Scheduler._resolve_graft_segment(
                 self,
                 req, segment, [x for t in synthetic_indices for x in t.tolist()], synthetic_tokens

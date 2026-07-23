@@ -213,6 +213,7 @@ class KVTextControlSpec:
 class KVGraftRecomputeTail:
     token_start: int
     token_end: int
+    token_ids: Optional[List[int]] = None
 
     def __post_init__(self):
         if int(self.token_start) < 0:
@@ -221,6 +222,14 @@ class KVGraftRecomputeTail:
             raise ValueError("recompute_tail.token_end must be >= 0")
         if int(self.token_end) <= int(self.token_start):
             raise ValueError("recompute_tail.token_end must be > token_start")
+        if self.token_ids is not None:
+            self.token_ids = [int(token_id) for token_id in self.token_ids]
+            if len(self.token_ids) != int(self.token_end) - int(self.token_start):
+                raise ValueError(
+                    "recompute_tail.token_ids length must equal token_end - token_start"
+                )
+            if any(token_id < 0 for token_id in self.token_ids):
+                raise ValueError("recompute_tail.token_ids must be non-negative")
 
 
 @dataclass
