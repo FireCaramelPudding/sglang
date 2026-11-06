@@ -136,7 +136,6 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-O3"
     "-Xcompiler"
     "-fPIC"
-    "-gencode=arch=compute_90,code=sm_90"
     "-std=c++17"
     "-DFLASHINFER_ENABLE_F16"
     "-DCUTE_USE_PACKED_TUPLE=1"
@@ -206,7 +205,6 @@ endif()
 if (ENABLE_BELOW_SM90)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_80,code=sm_80"
-        "-gencode=arch=compute_89,code=sm_89"
     )
     if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
         list(APPEND SGL_KERNEL_CUDA_FLAGS
@@ -216,7 +214,7 @@ if (ENABLE_BELOW_SM90)
 
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
+if (SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100a,code=sm_100a"
         "-gencode=arch=compute_120a,code=sm_120a"
@@ -242,14 +240,14 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     endif()
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
+if (SGL_KERNEL_ENABLE_FA3)
     set(SGL_KERNEL_ENABLE_FA3 ON)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
     )
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
+if (SGL_KERNEL_ENABLE_FP4)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-DENABLE_NVFP4=1"
     )
@@ -515,7 +513,7 @@ target_link_libraries(spatial_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
 install(TARGETS spatial_ops LIBRARY DESTINATION sgl_kernel)
 
 # ============================ Extra Install: FLashMLA ============================= #
-include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)
+# FlashMLA requires SM90/SM100 and is disabled for the A100 build.
 
 # ============================ Extra Install: DeepGEMM (JIT) ============================= #
 # Create a separate library for DeepGEMM's Python API.
