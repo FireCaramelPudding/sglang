@@ -299,6 +299,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
 
+    # Per-request logical KV spans carrying additive attention-logit biases.
+    graft_attention_bias_spans: Optional[List[List[Tuple[int, int, float]]]] = None
+
     # The indices of output tokens in the token_to_kv_pool_swa
     out_cache_loc_swa: Optional[torch.Tensor] = None
     # The indices to track mamba state with
@@ -456,6 +459,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             seq_lens_sum=batch.seq_lens_sum,
             seq_lens_cpu=batch.seq_lens_cpu,
             orig_seq_lens=batch.orig_seq_lens,
+            graft_attention_bias_spans=batch.graft_attention_bias_spans,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,

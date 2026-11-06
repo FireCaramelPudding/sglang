@@ -19,6 +19,7 @@ processes (TokenizerManager, DetokenizerManager, Scheduler).
 from __future__ import annotations
 
 import copy
+import math
 import uuid
 from abc import ABC
 from collections import Counter
@@ -238,10 +239,13 @@ class KVGraftSegment:
     token_start: Optional[int] = None
     token_end: Optional[int] = None
     origin_start: int = 0
+    attention_bias: float = 0.0
     transform: Optional[KVTransformSpec] = None
     recompute_tail: Optional[Union[KVGraftRecomputeTail, Dict[str, Any]]] = None
 
     def __post_init__(self):
+        if not math.isfinite(float(self.attention_bias)):
+            raise ValueError("attention_bias must be finite")
         if self.token_start is not None and self.token_start < 0:
             raise ValueError("token_start must be >= 0")
         if self.token_end is not None and self.token_end < 0:

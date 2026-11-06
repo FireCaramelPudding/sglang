@@ -318,8 +318,48 @@ class Scheduler(
         return type("LayerStub", (), {"layer_id": layer_id})()
 
     def _graft_layer_ids(self) -> List[int]:
-        attention_layers = getattr(self.tp_worker.model_runner, "attention_layers", [])
-        return [layer.layer_id for layer in attention_layers if layer is not None]
+        cached = getattr(self, "_kv_graft_layer_ids_cache", None)
+        if cached is not None:
+            return cached
+
+        # `model_runner.attention_layers` is populated as a side effect of
+        # piecewise-CUDA-graph initialization.  KV grafting must not silently
+        # become a zero-layer no-op when piecewise graphs are disabled.
+        attention_layers = getattr(
+            self.tp_worker.model_runner, "attention_layers", []
+        )
+        layer_ids = [
+            int(layer.layer_id) for layer in attention_layers if layer is not None
+        ]
+        source = "model_runner.attention_layers"
+        if not layer_ids:
+            kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+            full_attention_mapping = getattr(
+                kv_pool, "full_attention_layer_id_mapping", None
+            )
+            if full_attention_mapping:
+                layer_ids = sorted(int(layer_id) for layer_id in full_attention_mapping)
+                source = "kv_pool.full_attention_layer_id_mapping"
+            else:
+                start_layer = int(getattr(kv_pool, "start_layer", 0))
+                layer_num = int(getattr(kv_pool, "layer_num", 0))
+                layer_ids = list(range(start_layer, start_layer + layer_num))
+                source = "kv_pool.layer_range"
+
+        if not layer_ids:
+            raise RuntimeError(
+                "KV grafting could not resolve any attention layers; refusing "
+                "to materialize an empty KV transform"
+            )
+        self._kv_graft_layer_ids_cache = layer_ids
+        logger.info(
+            "[kv_graft layers] source=%s count=%s range=[%s,%s]",
+            source,
+            len(layer_ids),
+            layer_ids[0],
+            layer_ids[-1],
+        )
+        return layer_ids
 
     def _should_export_after_prefill(
         self, export_spec: Optional[KVExportSpec], prompt_len: int
@@ -1543,6 +1583,7 @@ class Scheduler(
         aliased_indices: List[torch.Tensor] = []
         synthetic_owned_masks: List[torch.Tensor] = []
         recompute_tail_tokens: List[int] = []
+        req.graft_attention_bias_spans = []
         tail_segment_indices = [
             index
             for index, segment in enumerate(recv_req.kv_graft.segments)
@@ -1555,6 +1596,7 @@ class Scheduler(
                 "recompute_tail is supported only on the final graft segment"
             )
         for segment in recv_req.kv_graft.segments:
+            segment_logical_start = len(synthetic_tokens)
             recompute_tail = getattr(segment, "recompute_tail", None)
             if recompute_tail is not None:
                 entry = self.kv_handle_registry.lookup(
@@ -1595,6 +1637,11 @@ class Scheduler(
                 req, segment, [x for t in synthetic_indices for x in t.tolist()], synthetic_tokens
             )
             synthetic_tokens.extend(seg_tokens)
+            attention_bias = float(getattr(segment, "attention_bias", 0.0) or 0.0)
+            if attention_bias != 0.0:
+                req.graft_attention_bias_spans.append(
+                    (segment_logical_start, len(synthetic_tokens), attention_bias)
+                )
             synthetic_indices.append(seg_indices)
             synthetic_owned_masks.append(
                 torch.full(

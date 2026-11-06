@@ -25,6 +25,10 @@ from sglang.srt.managers.kv_graft_materializer import (
     MHAGraftMaterializer,
     MLAGraftMaterializer,
 )
+from sglang.srt.layers.attention.torch_native_backend import (
+    build_graft_attention_mask,
+    build_sdpa_graft_mask,
+)
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import CacheAwarePolicy, SchedulePolicy
 from sglang.srt.managers.scheduler import Scheduler
@@ -114,7 +118,7 @@ class _RecordingMHAMaterializer(MHAGraftMaterializer):
         self.ops.append("rescale")
         return src + 10.0
 
-    def _rope_shift_tensor(self, k, delta, origin_start=0):
+    def _rope_shift_tensor(self, k, delta, origin_start=0, compute_mode="bf16_absolute"):
         self.ops.append("rope")
         return k + 100.0
 
@@ -128,7 +132,7 @@ class _RecordingMLAMaterializer(MLAGraftMaterializer):
         self.ops.append("rescale")
         return src + 10.0
 
-    def _rope_shift_tensor(self, k, delta, origin_start=0):
+    def _rope_shift_tensor(self, k, delta, origin_start=0, compute_mode="bf16_absolute"):
         self.ops.append("rope")
         return k + 100.0
 
@@ -1373,6 +1377,95 @@ class TestKVGraftRegressions(unittest.TestCase):
         out_norms = torch.norm(out, p=2, dim=-1)
         self.assertAlmostEqual(
             (out_norms[1] / out_norms[0]).item(), 2.0, places=4
+        )
+
+    def test_rescale_tensor_matches_target_norm_per_kv_head(self):
+        src = torch.tensor(
+            [
+                [[3.0, 4.0], [0.0, 2.0]],
+                [[6.0, 8.0], [0.0, 4.0]],
+            ]
+        )
+        tgt = torch.tensor(
+            [
+                [[1.0, 0.0], [0.0, 6.0]],
+                [[1.0, 0.0], [0.0, 6.0]],
+                [[1.0, 0.0], [0.0, 6.0]],
+            ]
+        )
+
+        out = BaseKVGraftMaterializer._rescale_tensor(src, tgt)
+
+        out_mean = torch.norm(out, p=2, dim=-1).mean(dim=0)
+        tgt_mean = torch.norm(tgt, p=2, dim=-1).mean(dim=0)
+        self.assertTrue(torch.allclose(out_mean, tgt_mean, atol=1e-5))
+
+    def test_rope_shift_matches_absolute_source_and_target_positions(self):
+        materializer = BaseKVGraftMaterializer(_FakeKVPool(), rope_theta=5000000.0)
+        base = torch.randn(4, 2, 8, generator=torch.Generator().manual_seed(7))
+
+        def rotate(value, positions):
+            dim = value.shape[-1]
+            inv_freq = 1.0 / (
+                materializer.rope_theta
+                ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
+            )
+            angles = positions[:, None] * inv_freq[None, :]
+            cos = torch.cat([angles.cos(), angles.cos()], dim=-1).unsqueeze(1)
+            sin = torch.cat([angles.sin(), angles.sin()], dim=-1).unsqueeze(1)
+            return value * cos + materializer._rotate_half(value) * sin
+
+        source_positions = torch.arange(37, 41, dtype=torch.float32)
+        source_k = rotate(base, source_positions)
+        shifted = materializer._rope_shift_tensor(
+            source_k, delta=113, origin_start=37
+        )
+        expected = rotate(base, source_positions + 113)
+
+        self.assertTrue(torch.allclose(shifted, expected, atol=2e-5, rtol=2e-5))
+
+    def test_attention_bias_mask_zero_bypasses_and_span_is_additive(self):
+        self.assertIsNone(
+            build_graft_attention_mask(
+                [(1, 3, 0.0)], 4, dtype=torch.float32, device=torch.device("cpu")
+            )
+        )
+        mask = build_graft_attention_mask(
+            [(1, 3, -1.0)], 4, dtype=torch.float32, device=torch.device("cpu")
+        )
+        self.assertTrue(
+            torch.equal(mask.flatten(), torch.tensor([0.0, -1.0, -1.0, 0.0]))
+        )
+
+        causal_mask, use_native_causal = build_sdpa_graft_mask(
+            [(1, 3, -1.0)],
+            4,
+            4,
+            causal=True,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        self.assertFalse(use_native_causal)
+        self.assertTrue(torch.isneginf(causal_mask[0, 0, 0, 1]))
+        self.assertEqual(causal_mask[0, 0, 3, 1].item(), -1.0)
+
+        prefix_mask, use_native_causal = build_sdpa_graft_mask(
+            [],
+            2,
+            4,
+            query_start=2,
+            causal=True,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        self.assertFalse(use_native_causal)
+        self.assertTrue(
+            torch.equal(
+                prefix_mask[0, 0],
+                torch.tensor(
+                    [[True, True, True, False], [True, True, True, True]]
+                ),
+            )
         )
 
     def test_rescale_norm_debug_gate_is_side_effect_free(self):

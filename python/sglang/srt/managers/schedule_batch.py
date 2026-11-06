@@ -594,6 +594,7 @@ class Req(ReqDllmMixin):
         self.graft_prefix_owned_mask: torch.Tensor = torch.empty((0,), dtype=torch.bool)
         self.kv_exports: List[KVHandleMeta] = []
         self.synthetic_prefix_physical_len: int = 0
+        self.graft_attention_bias_spans: List[Tuple[int, int, float]] = []
         self.kv_graft_materialize_tokens: int = 0
         self.kv_graft_quantized_tail_tokens: int = 0
         self.kv_graft_gpu_resident_tokens: int = 0
@@ -2402,6 +2403,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             out_cache_loc=self.out_cache_loc,
             seq_lens_cpu=seq_lens_cpu,
             seq_lens_sum=self.seq_lens_sum,
+            graft_attention_bias_spans=[
+                list(getattr(req, "graft_attention_bias_spans", []))
+                for req in self.reqs
+            ],
             return_logprob=self.return_logprob,
             top_logprobs_nums=self.top_logprobs_nums,
             token_ids_logprobs=self.token_ids_logprobs,
@@ -2603,6 +2608,9 @@ class ModelWorkerBatch:
 
     # The original sequence lengths, Qwen-1M related
     orig_seq_lens: Optional[torch.Tensor] = None
+
+    # Logical [start, end) KV spans receiving an additive attention-logit bias.
+    graft_attention_bias_spans: Optional[List[List[Tuple[int, int, float]]]] = None
 
     # The input Embeds
     input_embeds: Optional[torch.Tensor] = None

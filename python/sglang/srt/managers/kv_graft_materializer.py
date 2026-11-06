@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 import torch
@@ -31,6 +33,8 @@ class GraftMaterializeResult:
 
 
 class BaseKVGraftMaterializer:
+    _context_map_cache = {}
+
     def __init__(self, kv_pool: KVCache, rope_theta: float = 10000.0):
         self.kv_pool = kv_pool
         self.rope_theta = float(rope_theta) if rope_theta and rope_theta > 0 else 10000.0
@@ -92,6 +96,21 @@ class BaseKVGraftMaterializer:
         overall_norm = torch.norm(overall_k, p=2, dim=-1).mean()
         ratio = overall_norm / (sys_norm + eps)
         return max(1.0, min(float(ratio.item()), 5.0))
+
+    @staticmethod
+    def _oracle_layer_selected(layer_id: int, params: dict) -> bool:
+        """Return whether a half-open diagnostic layer interval contains layer_id."""
+        layer_start = int(params.get("oracle_layer_start", 0) or 0)
+        layer_end_raw = params.get("oracle_layer_end")
+        layer_end = int(layer_end_raw) if layer_end_raw is not None else 1 << 30
+        if layer_start < 0 or layer_end < layer_start:
+            raise ValueError(
+                "oracle_mix requires 0 <= oracle_layer_start <= oracle_layer_end"
+            )
+        selected = layer_start <= int(layer_id) < layer_end
+        if bool(params.get("oracle_layer_invert")):
+            selected = not selected
+        return selected
 
     @staticmethod
     def _rescale_tensor(
@@ -159,7 +178,11 @@ class BaseKVGraftMaterializer:
         return torch.cat((-x2, x1), dim=-1)
 
     def _rope_shift_tensor(
-        self, k: torch.Tensor, delta: int, origin_start: int = 0
+        self,
+        k: torch.Tensor,
+        delta: float,
+        origin_start: int = 0,
+        compute_mode: str = "bf16_absolute",
     ) -> torch.Tensor:
         if delta == 0:
             return k
@@ -173,12 +196,32 @@ class BaseKVGraftMaterializer:
             theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim)
         )
 
-        # Match local HF path exactly: undo source-position rotation, then apply
-        # target-position rotation. This uses absolute source/target positions
-        # instead of relying on a pure relative-delta composition shortcut.
-        #
-        # For grafted KV slices, token axis is leading axis in SGLang
-        # ([token, head, dim] for MHA, [token, 1, dim] for MLA rope part).
+        if compute_mode == "fp32_relative":
+            # Standard RoPE is a block-diagonal rotation, therefore
+            # R(target) R(source)^-1 == R(target - source).  Applying the
+            # relative rotation once in FP32 avoids an unnecessary inverse and
+            # second BF16 rotation of an already-quantized K tensor.
+            angles = float(delta) * inv_freq
+            cos_delta = torch.cat([torch.cos(angles), torch.cos(angles)], dim=-1)
+            sin_delta = torch.cat([torch.sin(angles), torch.sin(angles)], dim=-1)
+            while cos_delta.dim() < k.dim():
+                cos_delta = cos_delta.unsqueeze(0)
+                sin_delta = sin_delta.unsqueeze(0)
+            k_fp32 = k.float()
+            return (
+                k_fp32 * cos_delta + self._rotate_half(k_fp32) * sin_delta
+            ).to(dtype=dtype)
+
+        if compute_mode not in ("bf16_absolute", "fp32_absolute"):
+            raise ValueError(
+                "rope_compute_mode must be bf16_absolute, fp32_absolute, or "
+                f"fp32_relative; got {compute_mode!r}"
+            )
+
+        # Absolute control: undo the source-position rotation and then apply
+        # the target-position rotation.  bf16_absolute preserves the historical
+        # implementation; fp32_absolute isolates the effect of arithmetic
+        # precision while keeping the formula unchanged.
         seq_len = int(k.shape[0])
         old_positions = torch.arange(
             int(origin_start),
@@ -191,18 +234,172 @@ class BaseKVGraftMaterializer:
         old_angles = old_positions[:, None] * inv_freq[None, :]
         new_angles = new_positions[:, None] * inv_freq[None, :]
 
-        cos_old = torch.cos(old_angles).to(dtype=dtype).unsqueeze(1)
-        sin_old = torch.sin(old_angles).to(dtype=dtype).unsqueeze(1)
-        cos_new = torch.cos(new_angles).to(dtype=dtype).unsqueeze(1)
-        sin_new = torch.sin(new_angles).to(dtype=dtype).unsqueeze(1)
+        work_dtype = dtype if compute_mode == "bf16_absolute" else torch.float32
+        cos_old = torch.cos(old_angles).to(dtype=work_dtype).unsqueeze(1)
+        sin_old = torch.sin(old_angles).to(dtype=work_dtype).unsqueeze(1)
+        cos_new = torch.cos(new_angles).to(dtype=work_dtype).unsqueeze(1)
+        sin_new = torch.sin(new_angles).to(dtype=work_dtype).unsqueeze(1)
 
         cos_old = torch.cat([cos_old, cos_old], dim=-1)
         sin_old = torch.cat([sin_old, sin_old], dim=-1)
         cos_new = torch.cat([cos_new, cos_new], dim=-1)
         sin_new = torch.cat([sin_new, sin_new], dim=-1)
 
-        k_base = k * cos_old - self._rotate_half(k) * sin_old
-        return k_base * cos_new + self._rotate_half(k_base) * sin_new
+        k_work = k if compute_mode == "bf16_absolute" else k.float()
+        k_base = k_work * cos_old - self._rotate_half(k_work) * sin_old
+        return (
+            k_base * cos_new + self._rotate_half(k_base) * sin_new
+        ).to(dtype=dtype)
+
+    @staticmethod
+    def _rope_layer_selected(layer_id: int, params: dict) -> bool:
+        """Whether RoPE should be applied to this layer.
+
+        An omitted or empty ``rope_layer_ranges`` means all layers.  Explicit
+        ranges are half-open and may be disjoint, which lets mechanism probes
+        test broad layer groups without changing or re-prefilling the source KV.
+        """
+        ranges = params.get("rope_layer_ranges")
+        if not ranges:
+            return True
+        for interval in ranges:
+            if not isinstance(interval, (list, tuple)) or len(interval) != 2:
+                raise ValueError(
+                    "rope_layer_ranges must contain [start, end] pairs"
+                )
+            start, end = int(interval[0]), int(interval[1])
+            if start < 0 or end <= start:
+                raise ValueError(
+                    "rope_layer_ranges requires 0 <= start < end"
+                )
+            if start <= int(layer_id) < end:
+                return True
+        return False
+
+    @staticmethod
+    def _rope_shift_scale(params: dict) -> float:
+        scale = float(params.get("rope_shift_scale", 1.0))
+        if not math.isfinite(scale) or scale < 0.0:
+            raise ValueError("rope_shift_scale must be finite and non-negative")
+        return scale
+
+    @classmethod
+    def _load_context_map(
+        cls, params: dict, layer_id: int, device: torch.device
+    ) -> torch.Tensor:
+        path_value = str(params.get("context_map_path", ""))
+        if not path_value:
+            raise ValueError("context_linear_map requires context_map_path")
+        path = str(Path(path_value).resolve())
+        payload = cls._context_map_cache.get(path)
+        if payload is None:
+            payload = torch.load(path, map_location="cpu", weights_only=True)
+            if int(payload.get("schema_version", 0)) != 1:
+                raise ValueError("unsupported context map schema")
+            cls._context_map_cache[path] = payload
+        tp_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        key = f"layer_{int(layer_id):02d}_rank_{int(tp_rank):02d}"
+        matrix = payload.get("maps", {}).get(key)
+        if matrix is None:
+            raise ValueError(f"context map missing {key}")
+        return matrix.to(device=device, dtype=torch.float32)
+
+    def _apply_context_map_tensor(
+        self,
+        k: torch.Tensor,
+        *,
+        delta: float,
+        origin_start: int,
+        matrix: torch.Tensor,
+    ) -> torch.Tensor:
+        """De-RoPE, apply a head-wise linear map, then re-RoPE at target positions."""
+        dim = int(k.shape[-1])
+        if dim % 2 != 0 or k.dim() != 3:
+            raise ValueError("context map requires token-major [token, head, even_dim] K")
+        if matrix.dim() == 2:
+            matrix = matrix.unsqueeze(0)
+        if tuple(matrix.shape) != (int(k.shape[1]), dim, dim):
+            raise ValueError(
+                f"context map shape {tuple(matrix.shape)} does not match K {tuple(k.shape)}"
+            )
+        inv_freq = 1.0 / (
+            self.rope_theta
+            ** (
+                torch.arange(0, dim, 2, device=k.device, dtype=torch.float32)
+                / dim
+            )
+        )
+        old_positions = torch.arange(
+            int(origin_start),
+            int(origin_start) + int(k.shape[0]),
+            device=k.device,
+            dtype=torch.float32,
+        )
+        new_positions = old_positions + float(delta)
+
+        def cos_sin(positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            angles = positions[:, None] * inv_freq[None, :]
+            cos = torch.cat([torch.cos(angles), torch.cos(angles)], dim=-1)
+            sin = torch.cat([torch.sin(angles), torch.sin(angles)], dim=-1)
+            return cos.unsqueeze(1), sin.unsqueeze(1)
+
+        cos_old, sin_old = cos_sin(old_positions)
+        cos_new, sin_new = cos_sin(new_positions)
+        k_fp32 = k.float()
+        canonical = k_fp32 * cos_old - self._rotate_half(k_fp32) * sin_old
+        mapped = torch.einsum(
+            "thd,hde->the", canonical.float(), matrix
+        )
+        rotated = mapped * cos_new + self._rotate_half(mapped) * sin_new
+        return rotated.to(dtype=k.dtype)
+
+    @classmethod
+    def _load_receiver_bridge_map(
+        cls, params: dict, layer_id: int, device: torch.device
+    ) -> dict[str, torch.Tensor]:
+        path_value = str(params.get("bridge_map_path", ""))
+        if not path_value:
+            raise ValueError("receiver_bridge_map requires bridge_map_path")
+        path = str(Path(path_value).resolve())
+        payload = cls._context_map_cache.get(path)
+        if payload is None:
+            payload = torch.load(path, map_location="cpu", weights_only=True)
+            if int(payload.get("schema_version", 0)) != 2:
+                raise ValueError("unsupported receiver bridge map schema")
+            cls._context_map_cache[path] = payload
+        tp_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        key = f"layer_{int(layer_id):02d}_rank_{int(tp_rank):02d}"
+        block = payload.get("maps", {}).get(key)
+        if block is None:
+            raise ValueError(f"receiver bridge map missing {key}")
+        return {
+            name: value.to(device=device, dtype=torch.float32)
+            for name, value in block.items()
+        }
+
+    @staticmethod
+    def _apply_receiver_bridge_map_tensor(
+        value: torch.Tensor, matrix: torch.Tensor, bias: torch.Tensor
+    ) -> torch.Tensor:
+        if value.dim() != 3:
+            raise ValueError("receiver bridge map requires [token, head, dim]")
+        heads, dim = int(value.shape[1]), int(value.shape[2])
+        if tuple(matrix.shape) != (heads, dim, dim):
+            raise ValueError(
+                f"receiver bridge matrix {tuple(matrix.shape)} != {(heads, dim, dim)}"
+            )
+        if tuple(bias.shape) != (heads, dim):
+            raise ValueError(
+                f"receiver bridge bias {tuple(bias.shape)} != {(heads, dim)}"
+            )
+        mapped = torch.einsum("thd,hde->the", value.float(), matrix) + bias
+        return mapped.to(dtype=value.dtype)
+
+    @staticmethod
+    def _synchronize_materialization(device: torch.device) -> None:
+        """Make newly materialized pages visible before a forward can consume them."""
+        if device.type == "cuda":
+            torch.cuda.current_stream(device=device).synchronize()
 
 
 class MHAGraftMaterializer(BaseKVGraftMaterializer):
@@ -221,6 +418,22 @@ class MHAGraftMaterializer(BaseKVGraftMaterializer):
         copy_only = bool(getattr(transform, "rescale_params", None) and transform.rescale_params.get("copy_only"))
         alias_bypass = bool(getattr(transform, "rescale_params", None) and transform.rescale_params.get("alias_bypass"))
         _rescale_params = getattr(transform, "rescale_params", None) or {}
+        verify_copy = bool(_rescale_params.get("verify_copy"))
+        diagnostic_k_scale = float(
+            _rescale_params.get("diagnostic_k_scale", 1.0) or 0.0
+        )
+        diagnostic_v_scale = float(
+            _rescale_params.get("diagnostic_v_scale", 1.0) or 0.0
+        )
+        rope_compute_mode = str(
+            _rescale_params.get("rope_compute_mode", "bf16_absolute")
+            or "bf16_absolute"
+        )
+        rope_shift_scale = self._rope_shift_scale(_rescale_params)
+        scaled_delta = float(delta) * rope_shift_scale
+        context_map_enabled = transform.rescale_profile == "context_linear_map"
+        # receiver_bridge_map_v1: closed-form map over receiver-computed T KV.
+        bridge_map_enabled = transform.rescale_profile == "receiver_bridge_map"
         k_amplify_token_count = int(_rescale_params.get("k_amplify_token_count", 0) or 0)
         k_amplify_ratio = float(_rescale_params.get("k_amplify_ratio", 0) or 0)
         k_amplify_mode = str(_rescale_params.get("k_amplify_mode", "fixed") or "fixed")
@@ -230,17 +443,22 @@ class MHAGraftMaterializer(BaseKVGraftMaterializer):
             and (k_amplify_ratio > 0 or k_amplify_mode == "auto")
         )
         logger.info(
-            "[kv_graft materialize MHA] src_len=%s dst_len=%s ref_len=%s origin_start=%s current_prefix_len=%s delta=%s rope=%s rescale=%s copy_only=%s alias_bypass=%s k_amplify=%s k_amplify_ratio=%s k_amplify_mode=%s k_amplify_tokens=%s",
+            "[kv_graft materialize MHA] src_len=%s dst_len=%s ref_len=%s origin_start=%s current_prefix_len=%s delta=%s scaled_delta=%s rope=%s rope_scale=%s rope_ranges=%s rescale=%s copy_only=%s alias_bypass=%s diagnostic_k_scale=%s diagnostic_v_scale=%s k_amplify=%s k_amplify_ratio=%s k_amplify_mode=%s k_amplify_tokens=%s",
             int(source_indices.numel()),
             int(dst_indices.numel()),
             int(reference_indices.numel()) if reference_indices is not None else 0,
             origin_start,
             current_prefix_len_before_append,
             delta,
+            scaled_delta,
             getattr(transform, "rope_shift", None),
+            rope_shift_scale,
+            _rescale_params.get("rope_layer_ranges"),
             getattr(transform, "rescale_profile", None),
             copy_only,
             alias_bypass,
+            diagnostic_k_scale,
+            diagnostic_v_scale,
             k_amplify_enabled,
             k_amplify_ratio,
             k_amplify_mode,
@@ -248,9 +466,31 @@ class MHAGraftMaterializer(BaseKVGraftMaterializer):
         )
         sample_src = source_indices[: min(8, int(source_indices.numel()))].tolist()
         sample_dst = dst_indices[: min(8, int(dst_indices.numel()))].tolist()
+        max_copy_k_diff = 0.0
+        max_copy_v_diff = 0.0
         for layer_id in layer_ids:
-            k = self.kv_pool.get_key_buffer(layer_id)[source_indices]
-            v = self.kv_pool.get_value_buffer(layer_id)[source_indices]
+            # Explicit clones make the source snapshot independent of allocator
+            # reuse and of any overlapping advanced-index assignment.
+            k = self.kv_pool.get_key_buffer(layer_id)[source_indices].clone()
+            v = self.kv_pool.get_value_buffer(layer_id)[source_indices].clone()
+            oracle_mix = transform.rescale_profile == "oracle_mix"
+            oracle_layer_selected = self._oracle_layer_selected(
+                layer_id, _rescale_params
+            )
+            oracle_replace_k = bool(_rescale_params.get("oracle_replace_k"))
+            oracle_replace_v = bool(_rescale_params.get("oracle_replace_v"))
+            oracle_replace_k_this_layer = (
+                oracle_mix and oracle_layer_selected and oracle_replace_k
+            )
+            oracle_replace_v_this_layer = (
+                oracle_mix and oracle_layer_selected and oracle_replace_v
+            )
+            if oracle_mix and reference_indices is None:
+                raise ValueError("oracle_mix requires reference_handle KV indices")
+            if oracle_mix and reference_indices.numel() != source_indices.numel():
+                raise ValueError(
+                    "oracle_mix source/reference token lengths must be identical"
+                )
             orig_k = k if copy_only else None
             orig_v = v if copy_only else None
             if copy_only and layer_id == layer_ids[0]:
@@ -294,23 +534,116 @@ class MHAGraftMaterializer(BaseKVGraftMaterializer):
                         "[kv_graft rescale MHA] src_norm=%.4f rescaled_norm=%.4f scale=%.4f",
                         src_norm, rescaled_norm, scale_factor,
                     )
+            if oracle_replace_k_this_layer or oracle_replace_v_this_layer:
+                ref_k = self.kv_pool.get_key_buffer(layer_id)[reference_indices]
+                ref_v = self.kv_pool.get_value_buffer(layer_id)[reference_indices]
+                if tuple(ref_k.shape) != tuple(k.shape) or tuple(ref_v.shape) != tuple(v.shape):
+                    raise ValueError(
+                        "oracle_mix source/reference KV shapes must be identical: "
+                        f"source_k={tuple(k.shape)} reference_k={tuple(ref_k.shape)} "
+                        f"source_v={tuple(v.shape)} reference_v={tuple(ref_v.shape)}"
+                    )
+                if oracle_replace_k_this_layer:
+                    k = ref_k
+                if oracle_replace_v_this_layer:
+                    v = ref_v
+                logger.info(
+                    "[kv_graft oracle_mix MHA] layer=%s replace_k=%s replace_v=%s interval=[%s,%s)",
+                    layer_id,
+                    oracle_replace_k_this_layer,
+                    oracle_replace_v_this_layer,
+                    int(_rescale_params.get("oracle_layer_start", 0) or 0),
+                    _rescale_params.get("oracle_layer_end"),
+                )
             # Match the local HF path: statistics are aligned in the source
             # frame first, then K is rotated into the target position.
-            if not copy_only and transform.rope_shift in ("on", "auto") and delta != 0:
-                k = self._rope_shift_tensor(k, delta, origin_start=origin_start)
+            # A locally sourced oracle K is already encoded at the receiver's
+            # target positions, so only rotate K that still comes from foreign KV.
+            if bridge_map_enabled:
+                if oracle_replace_k_this_layer or oracle_replace_v_this_layer:
+                    raise ValueError("receiver_bridge_map cannot be combined with oracle KV")
+                bridge_map = self._load_receiver_bridge_map(
+                    _rescale_params, layer_id, device=k.device
+                )
+                k = self._apply_receiver_bridge_map_tensor(
+                    k, bridge_map["k_matrix"], bridge_map["k_bias"]
+                )
+                v = self._apply_receiver_bridge_map_tensor(
+                    v, bridge_map["v_matrix"], bridge_map["v_bias"]
+                )
+            if context_map_enabled:
+                if oracle_replace_k_this_layer:
+                    raise ValueError("context_linear_map cannot be combined with oracle K")
+                matrix = self._load_context_map(
+                    _rescale_params, layer_id, device=k.device
+                )
+                k = self._apply_context_map_tensor(
+                    k,
+                    delta=delta,
+                    origin_start=origin_start,
+                    matrix=matrix,
+                )
+            elif (
+                not copy_only
+                and not oracle_replace_k_this_layer
+                and transform.rope_shift in ("on", "auto")
+                and scaled_delta != 0
+                and self._rope_layer_selected(layer_id, _rescale_params)
+            ):
+                k = self._rope_shift_tensor(
+                    k,
+                    scaled_delta,
+                    origin_start=origin_start,
+                    compute_mode=rope_compute_mode,
+                )
+            if diagnostic_k_scale != 1.0 or diagnostic_v_scale != 1.0:
+                k_before_diagnostic = k
+                v_before_diagnostic = v
+                if diagnostic_k_scale != 1.0:
+                    k = k * diagnostic_k_scale
+                if diagnostic_v_scale != 1.0:
+                    v = v * diagnostic_v_scale
+                if layer_id == layer_ids[0]:
+                    k_change = (
+                        (k.float() - k_before_diagnostic.float()).abs().max().item()
+                        if k.numel() > 0
+                        else 0.0
+                    )
+                    v_change = (
+                        (v.float() - v_before_diagnostic.float()).abs().max().item()
+                        if v.numel() > 0
+                        else 0.0
+                    )
+                    logger.info(
+                        "[kv_graft diagnostic MHA] layer=%s k_scale=%s v_scale=%s max_k_change=%s max_v_change=%s",
+                        layer_id,
+                        diagnostic_k_scale,
+                        diagnostic_v_scale,
+                        k_change,
+                        v_change,
+                    )
             self.kv_pool.get_key_buffer(layer_id)[dst_indices] = k
             self.kv_pool.get_value_buffer(layer_id)[dst_indices] = v
-            if copy_only and layer_id == layer_ids[0]:
+            if copy_only and verify_copy:
                 copied_k = self.kv_pool.get_key_buffer(layer_id)[dst_indices]
                 copied_v = self.kv_pool.get_value_buffer(layer_id)[dst_indices]
                 k_diff = (copied_k.float() - orig_k.float()).abs().max().item() if copied_k.numel() > 0 else 0.0
                 v_diff = (copied_v.float() - orig_v.float()).abs().max().item() if copied_v.numel() > 0 else 0.0
-                logger.info(
-                    "[kv_graft copy_check MHA after] layer=%s max_k_diff=%s max_v_diff=%s",
-                    layer_id,
-                    k_diff,
-                    v_diff,
-                )
+                max_copy_k_diff = max(max_copy_k_diff, k_diff)
+                max_copy_v_diff = max(max_copy_v_diff, v_diff)
+                if k_diff != 0.0 or v_diff != 0.0:
+                    raise RuntimeError(
+                        "materialized MHA copy identity failed: "
+                        f"layer={layer_id} max_k_diff={k_diff} max_v_diff={v_diff}"
+                    )
+        self._synchronize_materialization(dst_indices.device)
+        if copy_only and verify_copy:
+            logger.info(
+                "[kv_graft copy_check MHA complete] layers=%s max_k_diff=%s max_v_diff=%s",
+                len(layer_ids),
+                max_copy_k_diff,
+                max_copy_v_diff,
+            )
 
 
 class MLAGraftMaterializer(BaseKVGraftMaterializer):
@@ -329,6 +662,17 @@ class MLAGraftMaterializer(BaseKVGraftMaterializer):
         copy_only = bool(getattr(transform, "rescale_params", None) and transform.rescale_params.get("copy_only"))
         alias_bypass = bool(getattr(transform, "rescale_params", None) and transform.rescale_params.get("alias_bypass"))
         _rescale_params = getattr(transform, "rescale_params", None) or {}
+        verify_copy = bool(_rescale_params.get("verify_copy"))
+        rope_compute_mode = str(
+            _rescale_params.get("rope_compute_mode", "bf16_absolute")
+            or "bf16_absolute"
+        )
+        rope_shift_scale = self._rope_shift_scale(_rescale_params)
+        scaled_delta = float(delta) * rope_shift_scale
+        if transform.rescale_profile == "context_linear_map":
+            raise ValueError("context_linear_map is currently supported only for MHA/GQA KV")
+        if transform.rescale_profile == "receiver_bridge_map":
+            raise ValueError("receiver_bridge_map is currently supported only for MHA/GQA KV")
         k_amplify_token_count = int(_rescale_params.get("k_amplify_token_count", 0) or 0)
         k_amplify_ratio = float(_rescale_params.get("k_amplify_ratio", 0) or 0)
         k_amplify_mode = str(_rescale_params.get("k_amplify_mode", "fixed") or "fixed")
@@ -338,14 +682,17 @@ class MLAGraftMaterializer(BaseKVGraftMaterializer):
             and (k_amplify_ratio > 0 or k_amplify_mode == "auto")
         )
         logger.info(
-            "[kv_graft materialize MLA] src_len=%s dst_len=%s ref_len=%s origin_start=%s current_prefix_len=%s delta=%s rope=%s rescale=%s copy_only=%s alias_bypass=%s k_amplify=%s k_amplify_ratio=%s k_amplify_mode=%s k_amplify_tokens=%s",
+            "[kv_graft materialize MLA] src_len=%s dst_len=%s ref_len=%s origin_start=%s current_prefix_len=%s delta=%s scaled_delta=%s rope=%s rope_scale=%s rope_ranges=%s rescale=%s copy_only=%s alias_bypass=%s k_amplify=%s k_amplify_ratio=%s k_amplify_mode=%s k_amplify_tokens=%s",
             int(source_indices.numel()),
             int(dst_indices.numel()),
             int(reference_indices.numel()) if reference_indices is not None else 0,
             origin_start,
             current_prefix_len_before_append,
             delta,
+            scaled_delta,
             getattr(transform, "rope_shift", None),
+            rope_shift_scale,
+            _rescale_params.get("rope_layer_ranges"),
             getattr(transform, "rescale_profile", None),
             copy_only,
             alias_bypass,
@@ -356,9 +703,13 @@ class MLAGraftMaterializer(BaseKVGraftMaterializer):
         )
         sample_src = source_indices[: min(8, int(source_indices.numel()))].tolist()
         sample_dst = dst_indices[: min(8, int(dst_indices.numel()))].tolist()
+        max_copy_nope_diff = 0.0
+        max_copy_rope_diff = 0.0
         for layer_id in layer_ids:
             layer_stub = type("LayerStub", (), {"layer_id": layer_id})()
             k_nope, k_rope = self.kv_pool.get_mla_kv_buffer(layer_stub, source_indices)
+            k_nope = k_nope.clone()
+            k_rope = k_rope.clone()
             orig_k_nope = k_nope if copy_only else None
             orig_k_rope = k_rope if copy_only else None
             if copy_only and layer_id == layer_ids[0]:
@@ -402,19 +753,39 @@ class MLAGraftMaterializer(BaseKVGraftMaterializer):
                         "[kv_graft rescale MLA] src_norm=%.4f rescaled_norm=%.4f scale=%.4f",
                         src_norm, rescaled_norm, scale_factor,
                     )
-            if not copy_only and transform.rope_shift in ("on", "auto") and delta != 0:
-                k_rope = self._rope_shift_tensor(k_rope, delta, origin_start=origin_start)
+            if (
+                not copy_only
+                and transform.rope_shift in ("on", "auto")
+                and scaled_delta != 0
+                and self._rope_layer_selected(layer_id, _rescale_params)
+            ):
+                k_rope = self._rope_shift_tensor(
+                    k_rope,
+                    scaled_delta,
+                    origin_start=origin_start,
+                    compute_mode=rope_compute_mode,
+                )
             self.kv_pool.set_mla_kv_buffer(layer_stub, dst_indices, k_nope, k_rope)
-            if copy_only and layer_id == layer_ids[0]:
+            if copy_only and verify_copy:
                 copied_k_nope, copied_k_rope = self.kv_pool.get_mla_kv_buffer(layer_stub, dst_indices, dst_dtype=k_nope.dtype)
                 nope_diff = (copied_k_nope.float() - orig_k_nope.float()).abs().max().item() if copied_k_nope.numel() > 0 else 0.0
                 rope_diff = (copied_k_rope.float() - orig_k_rope.float()).abs().max().item() if copied_k_rope.numel() > 0 else 0.0
-                logger.info(
-                    "[kv_graft copy_check MLA after] layer=%s max_nope_diff=%s max_rope_diff=%s",
-                    layer_id,
-                    nope_diff,
-                    rope_diff,
-                )
+                max_copy_nope_diff = max(max_copy_nope_diff, nope_diff)
+                max_copy_rope_diff = max(max_copy_rope_diff, rope_diff)
+                if nope_diff != 0.0 or rope_diff != 0.0:
+                    raise RuntimeError(
+                        "materialized MLA copy identity failed: "
+                        f"layer={layer_id} max_nope_diff={nope_diff} "
+                        f"max_rope_diff={rope_diff}"
+                    )
+        self._synchronize_materialization(dst_indices.device)
+        if copy_only and verify_copy:
+            logger.info(
+                "[kv_graft copy_check MLA complete] layers=%s max_nope_diff=%s max_rope_diff=%s",
+                len(layer_ids),
+                max_copy_nope_diff,
+                max_copy_rope_diff,
+            )
 
 
 def resolve_rope_theta_from_hf_config(hf_config) -> float:
